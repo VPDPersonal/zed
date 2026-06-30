@@ -48,7 +48,9 @@ pub struct ProjectPanelView {
     pub exclude: Vec<String>,
     /// Whether to hide the worktree root in this view, promoting its top-level
     /// folders to roots. Only takes effect when a single worktree is open.
-    pub hide_root: bool,
+    /// `None` inherits the global `project_panel.hide_root`; `Some(false)` lets a
+    /// view re-show the root even when the global setting hides it.
+    pub hide_root: Option<bool>,
 }
 
 /// The list of user-defined project panel views. Kept in its own settings type
@@ -185,7 +187,7 @@ impl Settings for ProjectPanelViewsSettings {
                     .into(),
                 include: view.include.unwrap_or_default(),
                 exclude: view.exclude.unwrap_or_default(),
-                hide_root: view.hide_root.unwrap_or(false),
+                hide_root: view.hide_root,
             })
             .collect();
         Self { views }

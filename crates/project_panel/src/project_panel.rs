@@ -40,7 +40,7 @@ use project::{
     git_store::{GitStoreEvent, RepositoryEvent, git_traversal::ChildEntriesGitIter},
     project_settings::GoToDiagnosticSeverityFilter,
 };
-use project_panel_settings::{ProjectPanelSettings, ProjectPanelViewsSettings};
+use project_panel_settings::{ProjectPanelSettings, ProjectPanelView, ProjectPanelViewsSettings};
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -643,10 +643,11 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     }
 }
 
-/// Returns the literal directory prefix of a glob: the path components up to (but not
-/// including) the first component that contains a wildcard. Returns `None` when the
-/// pattern starts with a wildcard (e.g. `**/*.cs`), so it has no fixed base directory.
-fn glob_literal_base_dir(glob: &str) -> Option<String> {
+/// Returns the literal path prefix of a glob: the components up to (but not including) the
+/// first component that contains a wildcard. Returns `None` only when the glob begins with a
+/// wildcard (e.g. `**/*.cs`), so it has no fixed prefix and can match at an arbitrary depth. A
+/// wildcard-free glob returns its full literal path.
+fn glob_literal_prefix_dir(glob: &str) -> Option<String> {
     let mut components = Vec::new();
     for component in glob.split('/') {
         if component.is_empty() {
@@ -662,6 +663,86 @@ fn glob_literal_base_dir(glob: &str) -> Option<String> {
     } else {
         Some(components.join("/"))
     }
+}
+
+/// Returns the literal *base directory* of a glob for `hide_root` promotion: the path before
+/// the first wildcard. Returns `None` for a glob with no wildcard at all (a literal path like
+/// `Assets/Scenes/Main.unity`, whose last component is the matched entry itself, not a base
+/// directory) or one that starts with a wildcard.
+fn glob_literal_base_dir(glob: &str) -> Option<String> {
+    if !glob.contains(['*', '?', '[', ']', '{', '}']) {
+        return None;
+    }
+    glob_literal_prefix_dir(glob)
+}
+
+/// Builds a [`PathMatcher`] for a view's glob list, or `None` when the list is empty or every
+/// pattern is invalid. Matching is case-sensitive and follows Zed's usual glob semantics (the
+/// same as `file_scan_exclusions`): a bare name like `bin` matches at any depth, so anchor with
+/// a path (`Assets/**`) to restrict to one location. The common all-valid list compiles in one
+/// shot; only on failure does it fall back to dropping individually-invalid patterns (logged),
+/// so one bad pattern doesn't disable the whole filter.
+fn build_view_matcher(globs: &[String]) -> Option<PathMatcher> {
+    if globs.is_empty() {
+        return None;
+    }
+    if let Ok(matcher) = PathMatcher::new(globs, PathStyle::Posix) {
+        return Some(matcher);
+    }
+    let valid: Vec<&str> = globs
+        .iter()
+        .filter_map(|glob| {
+            if PathMatcher::new([glob.as_str()], PathStyle::Posix).is_ok() {
+                Some(glob.as_str())
+            } else {
+                log::warn!("project_panel_views: ignoring invalid glob pattern {glob:?}");
+                None
+            }
+        })
+        .collect();
+    if valid.is_empty() {
+        return None;
+    }
+    PathMatcher::new(valid, PathStyle::Posix).log_err()
+}
+
+/// Whether an entry passes the active view's include/exclude filter. Directories bypass
+/// `include` so the tree structure is preserved (empty directories are pruned separately). An
+/// entry is excluded when it or any ancestor matches `exclude`, so excluding a directory hides
+/// everything beneath it.
+fn entry_passes_view_filter(
+    path: &RelPath,
+    is_dir: bool,
+    include: Option<&PathMatcher>,
+    exclude: Option<&PathMatcher>,
+) -> bool {
+    if let Some(exclude) = exclude
+        && path.ancestors().any(|ancestor| exclude.is_match(ancestor))
+    {
+        return false;
+    }
+    is_dir || include.map_or(true, |include| include.is_match(path))
+}
+
+/// Whether an unscanned directory could still hold a file the active include filter matches,
+/// used to avoid pruning a lazily-scanned ignored directory that lies on the path to (or
+/// inside) an include target. With no include filter, or an include that matches at an
+/// arbitrary depth, any directory could match.
+fn include_dir_could_match(
+    dir: &RelPath,
+    include_active: bool,
+    include_prefixes: &[String],
+    include_unbounded: bool,
+) -> bool {
+    if !include_active || include_unbounded {
+        return true;
+    }
+    let dir = dir.as_unix_str();
+    include_prefixes.iter().any(|prefix| {
+        dir == prefix
+            || dir.starts_with(&format!("{prefix}/"))
+            || prefix.starts_with(&format!("{dir}/"))
+    })
 }
 
 impl ProjectPanel {
@@ -828,10 +909,28 @@ impl ProjectPanel {
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let new_views = Self::views_settings(&this.project, cx).clone();
                 if project_panel_views != new_views {
+                    // Preserve the active view across settings edits by matching its name, so
+                    // reordering or inserting views doesn't silently switch which one is active.
+                    // Prefer the same index when its name is unchanged, so duplicate view names
+                    // (which only the first would otherwise match) don't snap to the wrong tab on
+                    // an unrelated edit.
+                    let active_name = project_panel_views
+                        .views
+                        .get(this.active_view)
+                        .map(|view| view.name.clone());
+                    let same_index_matches = active_name.as_ref().is_some_and(|name| {
+                        new_views.views.get(this.active_view).map(|view| &view.name) == Some(name)
+                    });
+                    if !same_index_matches {
+                        this.active_view = active_name
+                            .and_then(|name| {
+                                new_views.views.iter().position(|view| view.name == name)
+                            })
+                            .unwrap_or_else(|| {
+                                this.active_view.min(new_views.views.len().saturating_sub(1))
+                            });
+                    }
                     project_panel_views = new_views;
-                    this.active_view = this
-                        .active_view
-                        .min(project_panel_views.views.len().saturating_sub(1));
                     this.update_visible_entries(None, false, false, window, cx);
                     cx.notify();
                 }
@@ -1114,11 +1213,8 @@ impl ProjectPanel {
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
             let is_markdown = !is_dir && MarkdownPreviewView::is_markdown_path(&*entry.path);
 
-            let settings = ProjectPanelSettings::get_global(cx);
-            let visible_worktrees_count = project.visible_worktrees(cx).count();
-            let should_hide_rename = is_root
-                && (cfg!(target_os = "windows")
-                    || (settings.hide_root && visible_worktrees_count == 1));
+            let should_hide_rename =
+                is_root && (cfg!(target_os = "windows") || self.effective_hide_root(cx));
             let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
 
             let (has_git_repo, has_history) = {
@@ -2296,13 +2392,8 @@ impl ProjectPanel {
                     return;
                 }
 
-                if Some(entry) == worktree.read(cx).root_entry() {
-                    let settings = ProjectPanelSettings::get_global(cx);
-                    let visible_worktrees_count =
-                        self.project.read(cx).visible_worktrees(cx).count();
-                    if settings.hide_root && visible_worktrees_count == 1 {
-                        return;
-                    }
+                if Some(entry) == worktree.read(cx).root_entry() && self.effective_hide_root(cx) {
+                    return;
                 }
 
                 self.state.edit_state = Some(EditState {
@@ -4206,24 +4297,44 @@ impl ProjectPanel {
         let hide_hidden = settings.hide_hidden;
 
         let views_settings = Self::views_settings(&self.project, cx);
-        let active_view_index = self
-            .active_view
-            .min(views_settings.views.len().saturating_sub(1));
-        let active_view = views_settings.views.get(active_view_index);
-        let (view_include, view_exclude) = active_view
+        let active_view = self.resolved_view(views_settings, cx);
+        let view_include = active_view.and_then(|view| {
+            if view.include.is_empty() {
+                return None;
+            }
+            // When every include glob is invalid, match nothing (fail closed) so the
+            // misconfiguration shows up as an empty view rather than leaking the whole tree.
+            build_view_matcher(&view.include)
+                .or_else(|| PathMatcher::new(std::iter::empty::<&str>(), PathStyle::Posix).ok())
+        });
+        let view_exclude = active_view.and_then(|view| build_view_matcher(&view.exclude));
+        // Only revalidate the selection/marks against the new tree when a filter is active,
+        // so the unfiltered default path keeps its existing selection behavior.
+        let reconcile_marks = view_include.is_some() || view_exclude.is_some();
+        // Resolved here from the already-known active view and worktree count rather than via
+        // `effective_hide_root`, to avoid re-resolving the view a second time on the hot path.
+        let hide_root = visible_worktrees.len() == 1
+            && active_view
+                .and_then(|view| view.hide_root)
+                .unwrap_or(settings.hide_root);
+
+        // Literal path prefixes of the include globs, and whether any include can match at an
+        // arbitrary depth (leading wildcard). The empty-directory prune uses these to decide
+        // whether an unscanned ignored directory could still hold a matching file.
+        let (include_prefixes, include_unbounded) = active_view
+            .filter(|_| view_include.is_some())
             .map(|view| {
-                let build = |globs: &Vec<String>| {
-                    if globs.is_empty() {
-                        None
-                    } else {
-                        PathMatcher::new(globs, PathStyle::Posix).log_err()
+                let mut prefixes = Vec::new();
+                let mut unbounded = false;
+                for glob in &view.include {
+                    match glob_literal_prefix_dir(glob) {
+                        Some(prefix) => prefixes.push(prefix),
+                        None => unbounded = true,
                     }
-                };
-                (build(&view.include), build(&view.exclude))
+                }
+                (prefixes, unbounded)
             })
-            .unwrap_or((None, None));
-        let view_hide_root = active_view.is_some_and(|view| view.hide_root);
-        let hide_root = (settings.hide_root || view_hide_root) && visible_worktrees.len() == 1;
+            .unwrap_or_default();
 
         // With `hide_root` + `include` globs, each glob's literal base directory (the path
         // before the first wildcard) is promoted to a root and its strict ancestors hidden.
@@ -4239,13 +4350,22 @@ impl ProjectPanel {
                         .collect()
                 })
                 .unwrap_or_default();
-            let base_set: HashSet<&str> = base_dirs.iter().map(String::as_str).collect();
             let mut ancestors = HashSet::default();
             for base in &base_dirs {
-                let components: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
+                let components: Vec<&str> = base
+                    .split('/')
+                    .filter(|component| !component.is_empty())
+                    .collect();
                 for prefix_len in 0..components.len() {
                     let prefix = components[..prefix_len].join("/");
-                    if !base_set.contains(prefix.as_str()) {
+                    // Don't hide a prefix that is itself a base dir or sits inside one: with
+                    // overlapping bases (e.g. `Assets/**` and `Assets/Scenes/Special/**`) the
+                    // intermediate `Assets/Scenes` must still render under the promoted `Assets`
+                    // rather than be skipped, which would misrepresent the on-disk hierarchy.
+                    let within_a_base = base_dirs
+                        .iter()
+                        .any(|base| &prefix == base || prefix.starts_with(&format!("{base}/")));
+                    if !within_a_base {
                         ancestors.insert(prefix);
                     }
                 }
@@ -4254,6 +4374,12 @@ impl ProjectPanel {
         } else {
             HashSet::default()
         };
+
+        // Kept on the foreground side of the spawn so the post-rebuild reconcile can re-test
+        // marks/selection against the active view's filter (the matchers themselves move into
+        // the background tree walk).
+        let reconcile_include = view_include.clone();
+        let reconcile_exclude = view_exclude.clone();
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
             let new_state = cx
@@ -4356,19 +4482,12 @@ impl ProjectPanel {
                                 }
                             }
                             auto_folded_ancestors.clear();
-                            // Directories bypass `include` to keep the tree intact; empty
-                            // ones are pruned below.
-                            let view_allows = {
-                                let path = entry.path.as_ref();
-                                let included = entry.kind.is_dir()
-                                    || view_include
-                                        .as_ref()
-                                        .map_or(true, |matcher| matcher.is_match(path));
-                                let excluded = view_exclude
-                                    .as_ref()
-                                    .map_or(false, |matcher| matcher.is_match(path));
-                                included && !excluded
-                            };
+                            let view_allows = entry_passes_view_filter(
+                                entry.path.as_ref(),
+                                entry.kind.is_dir(),
+                                view_include.as_ref(),
+                                view_exclude.as_ref(),
+                            );
                             if view_allows
                                 && (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
@@ -4486,28 +4605,67 @@ impl ProjectPanel {
                             entry_iter.advance();
                         }
 
-                        // Drop directories with no visible file beneath them so include-filtered
-                        // views don't show empty folders. Needs a full-tree scan because the panel
-                        // only materializes children of expanded directories, so files in collapsed
-                        // folders are absent from `visible_worktree_entries`.
-                        if let Some(include) = &view_include {
+                        // Drop directories with no visible file beneath them so filtered views
+                        // don't show empty folders. Needs a full-tree scan because the panel only
+                        // materializes children of expanded directories, so files in collapsed
+                        // folders are absent from `visible_worktree_entries`. Runs for exclude-only
+                        // views too, since an exclude can empty a directory.
+                        if view_include.is_some() || view_exclude.is_some() {
                             let mut dirs_with_files: HashSet<String> = HashSet::default();
                             for entry in worktree_snapshot.entries(true, 0) {
-                                if entry.is_dir()
-                                    || (hide_gitignore && entry.is_ignored)
+                                if entry.is_dir() {
+                                    // An *unscanned* ignored directory hasn't loaded its children
+                                    // (lazy scan), so a matching file inside it wouldn't appear in
+                                    // this walk. Keep it (and its ancestors) only when the filter
+                                    // could plausibly match inside it: a scanned ignored directory
+                                    // is covered by its files below, and an unrelated ignored
+                                    // directory (Library/, Temp/, obj/ ...) is pruned like anything
+                                    // else so an include filter actually hides it.
+                                    if entry.kind.is_unloaded()
+                                        && entry_passes_view_filter(
+                                            entry.path.as_ref(),
+                                            true,
+                                            None,
+                                            view_exclude.as_ref(),
+                                        )
+                                        && include_dir_could_match(
+                                            entry.path.as_ref(),
+                                            view_include.is_some(),
+                                            &include_prefixes,
+                                            include_unbounded,
+                                        )
+                                    {
+                                        for ancestor in entry.path.ancestors() {
+                                            dirs_with_files
+                                                .insert(ancestor.as_unix_str().to_string());
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if (hide_gitignore && entry.is_ignored)
                                     || (hide_hidden && entry.is_hidden)
                                 {
                                     continue;
                                 }
-                                let path = entry.path.as_ref();
-                                if include.is_match(path)
-                                    && !view_exclude
-                                        .as_ref()
-                                        .map_or(false, |matcher| matcher.is_match(path))
-                                {
+                                if entry_passes_view_filter(
+                                    entry.path.as_ref(),
+                                    false,
+                                    view_include.as_ref(),
+                                    view_exclude.as_ref(),
+                                ) {
                                     for ancestor in entry.path.ancestors() {
                                         dirs_with_files.insert(ancestor.as_unix_str().to_string());
                                     }
+                                }
+                            }
+                            // Keep the in-progress "new file/folder" placeholder and its ancestor
+                            // chain so a filter doesn't prune the row hosting the rename editor.
+                            if let Some(new_entry) = visible_worktree_entries
+                                .iter()
+                                .find(|entry| entry.id == NEW_ENTRY_ID)
+                            {
+                                for ancestor in new_entry.path.ancestors() {
+                                    dirs_with_files.insert(ancestor.as_unix_str().to_string());
                                 }
                             }
                             let root_path = worktree_snapshot
@@ -4515,6 +4673,7 @@ impl ProjectPanel {
                                 .map(|entry| entry.path.as_unix_str().to_string());
                             visible_worktree_entries.retain(|entry| {
                                 !entry.is_dir()
+                                    || entry.id == NEW_ENTRY_ID
                                     || root_path.as_deref() == Some(entry.path.as_unix_str())
                                     || dirs_with_files.contains(entry.path.as_unix_str())
                             });
@@ -4561,6 +4720,44 @@ impl ProjectPanel {
                         worktree_id,
                         entry_id,
                     });
+                }
+                // A view's filter can drop the previously selected or marked entries from the
+                // tree. Bulk operations (delete/cut/copy) act on `marked_entries` by id against
+                // the worktree, which still holds the now-hidden entries, so leaving stale marks
+                // would let a delete hit files the active view no longer shows. Drop marks and
+                // selection the filter now hides (or that no longer exist). Tested against the
+                // filter rather than against what's currently rendered, so a mark inside a
+                // collapsed-but-permitted folder survives.
+                if reconcile_marks {
+                    let passes_filter = |this: &Self, selected: &SelectedEntry, cx: &App| {
+                        if selected.entry_id == NEW_ENTRY_ID {
+                            return true;
+                        }
+                        let Some(worktree) =
+                            this.project.read(cx).worktree_for_id(selected.worktree_id, cx)
+                        else {
+                            return false;
+                        };
+                        let entry_id = this.unflatten_entry_id(selected.entry_id);
+                        worktree.read(cx).entry_for_id(entry_id).is_some_and(|entry| {
+                            entry_passes_view_filter(
+                                entry.path.as_ref(),
+                                entry.is_dir(),
+                                reconcile_include.as_ref(),
+                                reconcile_exclude.as_ref(),
+                            )
+                        })
+                    };
+                    let marks = std::mem::take(&mut this.marked_entries);
+                    this.marked_entries = marks
+                        .into_iter()
+                        .filter(|mark| passes_filter(this, mark, cx))
+                        .collect();
+                    if let Some(selection) = this.selection
+                        && !passes_filter(this, &selection, cx)
+                    {
+                        this.selection = None;
+                    }
                 }
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
@@ -6649,6 +6846,12 @@ impl ProjectPanel {
             return Ok(());
         }
 
+        // The active view's filter would hide this entry, so don't expand its ancestors or
+        // move the selection/marks to something that won't be shown.
+        if self.entry_hidden_by_active_view(worktree_id, entry_id, cx) {
+            return Ok(());
+        }
+
         self.expand_entry(worktree_id, entry_id, cx);
         self.update_visible_entries(Some((worktree_id, entry_id)), false, true, window, cx);
         self.marked_entries.clear();
@@ -6901,7 +7104,81 @@ impl ProjectPanel {
         ProjectPanelViewsSettings::get(location, cx)
     }
 
+    /// The active view, but only when views are actually in effect: at least two are
+    /// configured (fewer shows no tabs) and exactly one worktree is visible (a project-local
+    /// view can't be attributed to one root in a multi-root workspace). Returns `None`
+    /// otherwise, which disables both the tabs and the filtering.
+    fn resolved_view<'a>(
+        &self,
+        views: &'a ProjectPanelViewsSettings,
+        cx: &App,
+    ) -> Option<&'a ProjectPanelView> {
+        if views.views.len() < 2 {
+            return None;
+        }
+        if self.project.read(cx).visible_worktrees(cx).count() != 1 {
+            return None;
+        }
+        views.views.get(self.active_view.min(views.views.len() - 1))
+    }
+
+    /// Whether the worktree root should be hidden, combining the global `hide_root` setting
+    /// with the active view's per-view override (`Some(false)` re-shows the root even when the
+    /// global setting hides it). Only ever true with a single visible worktree.
+    fn effective_hide_root(&self, cx: &App) -> bool {
+        if self.project.read(cx).visible_worktrees(cx).count() != 1 {
+            return false;
+        }
+        let global = ProjectPanelSettings::get_global(cx).hide_root;
+        let views = Self::views_settings(&self.project, cx);
+        self.resolved_view(views, cx)
+            .and_then(|view| view.hide_root)
+            .unwrap_or(global)
+    }
+
+    /// Whether the active view's include/exclude filter currently hides this entry. Used to
+    /// avoid revealing or expanding to an entry that wouldn't be shown anyway.
+    fn entry_hidden_by_active_view(
+        &self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &App,
+    ) -> bool {
+        let views = Self::views_settings(&self.project, cx);
+        let Some(view) = self.resolved_view(views, cx) else {
+            return false;
+        };
+        let include = if view.include.is_empty() {
+            None
+        } else {
+            build_view_matcher(&view.include)
+                .or_else(|| PathMatcher::new(std::iter::empty::<&str>(), PathStyle::Posix).ok())
+        };
+        let exclude = build_view_matcher(&view.exclude);
+        if include.is_none() && exclude.is_none() {
+            return false;
+        }
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return false;
+        };
+        let entry_id = self.unflatten_entry_id(entry_id);
+        worktree
+            .read(cx)
+            .entry_for_id(entry_id)
+            .is_some_and(|entry| {
+                !entry_passes_view_filter(
+                    entry.path.as_ref(),
+                    entry.is_dir(),
+                    include.as_ref(),
+                    exclude.as_ref(),
+                )
+            })
+    }
+
     fn render_view_tabs(&self, cx: &Context<Self>) -> Option<Div> {
+        if self.project.read(cx).visible_worktrees(cx).count() != 1 {
+            return None;
+        }
         let (view_count, names) = {
             let views = &Self::views_settings(&self.project, cx).views;
             if views.len() < 2 {

@@ -722,19 +722,24 @@ pub struct ProjectPanelViewSettingsContent {
     /// Display name of the view, shown in its tab.
     pub name: Option<String>,
     /// Glob patterns of files to show in this view. When empty, all files are shown.
-    /// Patterns are matched against worktree-relative paths. Directories are always
-    /// kept so the tree structure is preserved.
+    /// Patterns are matched case-sensitively against worktree-relative paths, with the same
+    /// semantics as `file_scan_exclusions`: a bare name like `bin` matches at any depth, so
+    /// anchor with a path such as `Assets/**` to restrict to one location. Directories are
+    /// always kept so the tree structure is preserved; empty ones are then hidden.
     ///
     /// Default: []
     pub include: Option<Vec<String>>,
-    /// Glob patterns of entries to hide in this view.
+    /// Glob patterns of entries to hide in this view. Excluding a directory also hides
+    /// everything beneath it. Same matching semantics as `include`.
     ///
     /// Default: []
     pub exclude: Option<Vec<String>>,
-    /// Whether to hide the worktree root in this view, promoting its top-level
-    /// folders to roots. Only takes effect when a single worktree is open.
+    /// Whether to hide the worktree root in this view, promoting its top-level folders to
+    /// roots. Only takes effect when a single worktree is open. When unset, inherits the
+    /// global `project_panel.hide_root`; set to `false` to show the root even when the global
+    /// setting hides it.
     ///
-    /// Default: false
+    /// Default: inherit `project_panel.hide_root`
     pub hide_root: Option<bool>,
 }
 
