@@ -894,6 +894,10 @@
       "on_drop": true,
     },
   },
+  // User-defined project panel views, shown as switchable tabs that filter the tree with
+  // per-view include/exclude globs. Fewer than two views means no tabs. Can be overridden
+  // per project via `.zed/settings.json`.
+  "project_panel_views": [],
   "outline_panel": {
     // Whether to show the outline panel button in the status bar
     "button": true,

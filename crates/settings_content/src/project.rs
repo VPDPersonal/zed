@@ -13,8 +13,9 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use util::serde::default_true;
 
 use crate::{
-    AllLanguageSettingsContent, DelayMs, ExtendingVec, ParseStatus, ProjectTerminalSettingsContent,
-    RootUserSettings, SaturatingBool, fallible_options,
+    AllLanguageSettingsContent, DelayMs, ExtendingVec, ParseStatus,
+    ProjectPanelViewSettingsContent, ProjectTerminalSettingsContent, RootUserSettings,
+    SaturatingBool, fallible_options,
 };
 
 #[with_fallible_options]
@@ -60,6 +61,14 @@ pub struct ProjectSettingsContent {
     pub lsp: LspSettingsMap,
 
     pub terminal: Option<ProjectTerminalSettingsContent>,
+
+    /// User-defined project panel views, shown as switchable tabs at the top of the
+    /// panel. Each view filters the tree with its own include/exclude globs. Can be set
+    /// globally in user settings or overridden per project via `.zed/settings.json`.
+    /// Fewer than two views configured means no tabs are shown.
+    ///
+    /// Default: []
+    pub project_panel_views: Option<Vec<ProjectPanelViewSettingsContent>>,
 
     /// Configuration for Debugger-related features
     #[serde(default)]

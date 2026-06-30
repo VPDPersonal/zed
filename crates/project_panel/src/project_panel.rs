@@ -25,7 +25,8 @@ use gpui::{
     ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel,
-    Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
+    Render, ScrollStrategy, SharedString, Stateful, Styled, Subscription, Task,
+    UniformListScrollHandle,
     WeakEntity, Window, actions, anchored, deferred, div, hsla, linear_color_stop, linear_gradient,
     point, px, size, transparent_white, uniform_list,
 };
@@ -39,13 +40,13 @@ use project::{
     git_store::{GitStoreEvent, RepositoryEvent, git_traversal::ChildEntriesGitIter},
     project_settings::GoToDiagnosticSeverityFilter,
 };
-use project_panel_settings::ProjectPanelSettings;
+use project_panel_settings::{ProjectPanelSettings, ProjectPanelViewsSettings};
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    DockSide, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides,
-    update_settings_file,
+    DockSide, ProjectPanelEntrySpacing, Settings, SettingsLocation, SettingsStore, ShowDiagnostics,
+    ShowIndentGuides, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::{
@@ -69,7 +70,7 @@ use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
     markdown::MarkdownInlineCode,
     maybe,
-    paths::{PathStyle, compare_paths},
+    paths::{PathMatcher, PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
 };
 use workspace::{
@@ -147,6 +148,8 @@ pub struct ProjectPanel {
     drag_target_entry: Option<DragTarget>,
     marked_entries: Vec<SelectedEntry>,
     selection: Option<SelectedEntry>,
+    // Index into `ProjectPanelViewsSettings::views` of the currently active view tab.
+    active_view: usize,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
     clipboard: Option<ClipboardEntry>,
@@ -640,6 +643,27 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     }
 }
 
+/// Returns the literal directory prefix of a glob: the path components up to (but not
+/// including) the first component that contains a wildcard. Returns `None` when the
+/// pattern starts with a wildcard (e.g. `**/*.cs`), so it has no fixed base directory.
+fn glob_literal_base_dir(glob: &str) -> Option<String> {
+    let mut components = Vec::new();
+    for component in glob.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component.contains(['*', '?', '[', ']', '{', '}']) {
+            break;
+        }
+        components.push(component);
+    }
+    if components.is_empty() {
+        None
+    } else {
+        Some(components.join("/"))
+    }
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -800,7 +824,17 @@ impl ProjectPanel {
             .detach();
 
             let mut project_panel_settings = *ProjectPanelSettings::get_global(cx);
+            let mut project_panel_views = Self::views_settings(&project, cx).clone();
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
+                let new_views = Self::views_settings(&this.project, cx).clone();
+                if project_panel_views != new_views {
+                    project_panel_views = new_views;
+                    this.active_view = this
+                        .active_view
+                        .min(project_panel_views.views.len().saturating_sub(1));
+                    this.update_visible_entries(None, false, false, window, cx);
+                    cx.notify();
+                }
                 let new_settings = *ProjectPanelSettings::get_global(cx);
                 if project_panel_settings != new_settings {
                     if project_panel_settings.hide_gitignore != new_settings.hide_gitignore {
@@ -840,6 +874,7 @@ impl ProjectPanel {
                 drag_target_entry: None,
                 marked_entries: Default::default(),
                 selection: None,
+                active_view: 0,
                 context_menu: None,
                 filename_editor,
                 clipboard: None,
@@ -4168,8 +4203,57 @@ impl ProjectPanel {
             .visible_worktrees(cx)
             .map(|worktree| worktree.read(cx).snapshot())
             .collect();
-        let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
+
+        let views_settings = Self::views_settings(&self.project, cx);
+        let active_view_index = self
+            .active_view
+            .min(views_settings.views.len().saturating_sub(1));
+        let active_view = views_settings.views.get(active_view_index);
+        let (view_include, view_exclude) = active_view
+            .map(|view| {
+                let build = |globs: &Vec<String>| {
+                    if globs.is_empty() {
+                        None
+                    } else {
+                        PathMatcher::new(globs, PathStyle::Posix).log_err()
+                    }
+                };
+                (build(&view.include), build(&view.exclude))
+            })
+            .unwrap_or((None, None));
+        let view_hide_root = active_view.is_some_and(|view| view.hide_root);
+        let hide_root = (settings.hide_root || view_hide_root) && visible_worktrees.len() == 1;
+
+        // With `hide_root` + `include` globs, each glob's literal base directory (the path
+        // before the first wildcard) is promoted to a root and its strict ancestors hidden.
+        // Globs without a literal base (e.g. `**/*.cs`) fall back to plain `hide_root`. Entry
+        // depth is derived from visible ancestors, so dropping the ancestors here is enough to
+        // render the base dirs as roots without further bookkeeping.
+        let view_root_ancestor_paths: HashSet<String> = if hide_root {
+            let base_dirs: Vec<String> = active_view
+                .map(|view| {
+                    view.include
+                        .iter()
+                        .filter_map(|glob| glob_literal_base_dir(glob))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let base_set: HashSet<&str> = base_dirs.iter().map(String::as_str).collect();
+            let mut ancestors = HashSet::default();
+            for base in &base_dirs {
+                let components: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
+                for prefix_len in 0..components.len() {
+                    let prefix = components[..prefix_len].join("/");
+                    if !base_set.contains(prefix.as_str()) {
+                        ancestors.insert(prefix);
+                    }
+                }
+            }
+            ancestors
+        } else {
+            HashSet::default()
+        };
 
         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
             let new_state = cx
@@ -4197,7 +4281,13 @@ impl ProjectPanel {
                         let mut auto_folded_ancestors = vec![];
                         let worktree_abs_path = worktree_snapshot.abs_path();
                         while let Some(entry) = entry_iter.entry() {
-                            if hide_root && Some(entry.entry) == worktree_snapshot.root_entry() {
+                            let is_worktree_root =
+                                Some(entry.entry) == worktree_snapshot.root_entry();
+                            if hide_root
+                                && (is_worktree_root
+                                    || view_root_ancestor_paths
+                                        .contains(entry.path.as_unix_str()))
+                            {
                                 if new_entry_parent_id == Some(entry.id) {
                                     visible_worktree_entries.push(Self::create_new_git_entry(
                                         entry.entry,
@@ -4266,7 +4356,21 @@ impl ProjectPanel {
                                 }
                             }
                             auto_folded_ancestors.clear();
-                            if (!hide_gitignore || !entry.is_ignored)
+                            // Directories bypass `include` to keep the tree intact; empty
+                            // ones are pruned below.
+                            let view_allows = {
+                                let path = entry.path.as_ref();
+                                let included = entry.kind.is_dir()
+                                    || view_include
+                                        .as_ref()
+                                        .map_or(true, |matcher| matcher.is_match(path));
+                                let excluded = view_exclude
+                                    .as_ref()
+                                    .map_or(false, |matcher| matcher.is_match(path));
+                                included && !excluded
+                            };
+                            if view_allows
+                                && (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
                             {
                                 visible_worktree_entries.push(entry.to_owned());
@@ -4380,6 +4484,40 @@ impl ProjectPanel {
                                 continue;
                             }
                             entry_iter.advance();
+                        }
+
+                        // Drop directories with no visible file beneath them so include-filtered
+                        // views don't show empty folders. Needs a full-tree scan because the panel
+                        // only materializes children of expanded directories, so files in collapsed
+                        // folders are absent from `visible_worktree_entries`.
+                        if let Some(include) = &view_include {
+                            let mut dirs_with_files: HashSet<String> = HashSet::default();
+                            for entry in worktree_snapshot.entries(true, 0) {
+                                if entry.is_dir()
+                                    || (hide_gitignore && entry.is_ignored)
+                                    || (hide_hidden && entry.is_hidden)
+                                {
+                                    continue;
+                                }
+                                let path = entry.path.as_ref();
+                                if include.is_match(path)
+                                    && !view_exclude
+                                        .as_ref()
+                                        .map_or(false, |matcher| matcher.is_match(path))
+                                {
+                                    for ancestor in entry.path.ancestors() {
+                                        dirs_with_files.insert(ancestor.as_unix_str().to_string());
+                                    }
+                                }
+                            }
+                            let root_path = worktree_snapshot
+                                .root_entry()
+                                .map(|entry| entry.path.as_unix_str().to_string());
+                            visible_worktree_entries.retain(|entry| {
+                                !entry.is_dir()
+                                    || root_path.as_deref() == Some(entry.path.as_unix_str())
+                                    || dirs_with_files.contains(entry.path.as_unix_str())
+                            });
                         }
 
                         par_sort_worktree_entries(
@@ -6734,6 +6872,83 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
     item_width
 }
 
+impl ProjectPanel {
+    fn set_active_view(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_view == index {
+            return;
+        }
+        self.active_view = index;
+        self.update_visible_entries(None, false, false, window, cx);
+        cx.notify();
+    }
+
+    /// Reads the configured views with project-local `.zed/settings.json` taken into
+    /// account. Views are scoped to the first visible worktree (the same worktree
+    /// `hide_root` targets), so a project can define its own tabs without affecting
+    /// other projects. Falls back to the global value when no worktree is open.
+    fn views_settings<'a>(
+        project: &Entity<Project>,
+        cx: &'a App,
+    ) -> &'a ProjectPanelViewsSettings {
+        let location = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| SettingsLocation {
+                worktree_id: worktree.read(cx).id(),
+                path: RelPath::empty(),
+            });
+        ProjectPanelViewsSettings::get(location, cx)
+    }
+
+    fn render_view_tabs(&self, cx: &Context<Self>) -> Option<Div> {
+        let (view_count, names) = {
+            let views = &Self::views_settings(&self.project, cx).views;
+            if views.len() < 2 {
+                return None;
+            }
+            (
+                views.len(),
+                views
+                    .iter()
+                    .map(|view| view.name.clone())
+                    .collect::<Vec<SharedString>>(),
+            )
+        };
+        let active_view = self.active_view.min(view_count - 1);
+
+        let mut tab_bar = h_flex().w_full().h(ui::Tab::container_height(cx));
+        for (index, name) in names.into_iter().enumerate() {
+            if index > 0 {
+                tab_bar =
+                    tab_bar.child(ui::Divider::vertical().color(ui::DividerColor::BorderFaded));
+            }
+            let is_active = index == active_view;
+            tab_bar = tab_bar.child(
+                h_flex()
+                    .id(("project-panel-view-tab", index))
+                    .flex_1()
+                    .h_full()
+                    .py_1()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .border_b_1()
+                    .when(!is_active, |style| {
+                        style
+                            .bg(cx.theme().colors().editor_background.opacity(0.6))
+                            .border_color(cx.theme().colors().border.opacity(0.6))
+                    })
+                    .child(Label::new(name).when(!is_active, |label| label.color(Color::Muted)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_active_view(index, window, cx);
+                    })),
+            );
+        }
+        Some(tab_bar)
+    }
+}
+
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = !self.state.visible_entries.is_empty();
@@ -6915,6 +7130,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .children(self.render_view_tabs(cx))
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {

@@ -718,6 +718,28 @@ pub struct ProjectPanelAutoOpenSettings {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ProjectPanelViewSettingsContent {
+    /// Display name of the view, shown in its tab.
+    pub name: Option<String>,
+    /// Glob patterns of files to show in this view. When empty, all files are shown.
+    /// Patterns are matched against worktree-relative paths. Directories are always
+    /// kept so the tree structure is preserved.
+    ///
+    /// Default: []
+    pub include: Option<Vec<String>>,
+    /// Glob patterns of entries to hide in this view.
+    ///
+    /// Default: []
+    pub exclude: Option<Vec<String>>,
+    /// Whether to hide the worktree root in this view, promoting its top-level
+    /// folders to roots. Only takes effect when a single worktree is open.
+    ///
+    /// Default: false
+    pub hide_root: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct ProjectPanelSettingsContent {
     /// Whether to show the project panel button in the status bar.
     ///

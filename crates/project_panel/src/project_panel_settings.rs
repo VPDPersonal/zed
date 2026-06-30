@@ -1,5 +1,5 @@
 use editor::{EditorSettings, ui_scrollbar_settings_from_raw};
-use gpui::Pixels;
+use gpui::{Pixels, SharedString};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
@@ -38,6 +38,25 @@ pub struct ProjectPanelSettings {
     pub sort_order: ProjectPanelSortOrder,
     pub diagnostic_badges: bool,
     pub git_status_indicator: bool,
+}
+
+/// A single resolved project panel view: a named filter over the worktree tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectPanelView {
+    pub name: SharedString,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    /// Whether to hide the worktree root in this view, promoting its top-level
+    /// folders to roots. Only takes effect when a single worktree is open.
+    pub hide_root: bool,
+}
+
+/// The list of user-defined project panel views. Kept in its own settings type
+/// (rather than on [`ProjectPanelSettings`]) because it holds a `Vec` and so cannot
+/// be `Copy` like the rest of the panel settings.
+#[derive(Clone, Debug, PartialEq, Eq, RegisterSetting)]
+pub struct ProjectPanelViewsSettings {
+    pub views: Vec<ProjectPanelView>,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -146,5 +165,29 @@ impl Settings for ProjectPanelSettings {
             diagnostic_badges: project_panel.diagnostic_badges.unwrap(),
             git_status_indicator: project_panel.git_status_indicator.unwrap(),
         }
+    }
+}
+
+impl Settings for ProjectPanelViewsSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let views = content
+            .project
+            .project_panel_views
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, view)| ProjectPanelView {
+                name: view
+                    .name
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("View {}", index + 1))
+                    .into(),
+                include: view.include.unwrap_or_default(),
+                exclude: view.exclude.unwrap_or_default(),
+                hide_root: view.hide_root.unwrap_or(false),
+            })
+            .collect();
+        Self { views }
     }
 }
