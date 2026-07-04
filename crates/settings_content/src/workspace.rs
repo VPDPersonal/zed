@@ -740,6 +740,13 @@ pub struct ProjectPanelViewSettingsContent {
     ///
     /// Default: inherit `project_panel.hide_root`
     pub hide_root: Option<bool>,
+    /// Literal worktree-relative paths of directories whose row is hidden in this view,
+    /// splicing their children one level up. Combined with `hide_root`, hiding a promoted
+    /// base directory (e.g. `skills` for an include of `skills/**`) renders its subfolders
+    /// as tree roots. Unlike `exclude`, the directory's contents remain visible.
+    ///
+    /// Default: []
+    pub hide_dirs: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

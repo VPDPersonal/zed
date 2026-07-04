@@ -4417,39 +4417,43 @@ impl ProjectPanel {
         // before the first wildcard) is promoted to a root and its strict ancestors hidden.
         // Globs without a literal base (e.g. `**/*.cs`) fall back to plain `hide_root`. Entry
         // depth is derived from visible ancestors, so dropping the ancestors here is enough to
-        // render the base dirs as roots without further bookkeeping.
-        let view_root_ancestor_paths: HashSet<String> = if hide_root {
-            let base_dirs: Vec<String> = active_view
-                .map(|view| {
-                    view.include
-                        .iter()
-                        .filter_map(|glob| glob_literal_base_dir(glob))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut ancestors = HashSet::default();
-            for base in &base_dirs {
-                let components: Vec<&str> = base
-                    .split('/')
-                    .filter(|component| !component.is_empty())
-                    .collect();
-                for prefix_len in 0..components.len() {
-                    let prefix = components[..prefix_len].join("/");
-                    // Don't hide a prefix that is itself a base dir or sits inside one: with
-                    // overlapping bases (e.g. `Assets/**` and `Assets/Scenes/Special/**`) the
-                    // intermediate `Assets/Scenes` must still render under the promoted `Assets`
-                    // rather than be skipped, which would misrepresent the on-disk hierarchy.
-                    let within_a_base = base_dirs
-                        .iter()
-                        .any(|base| &prefix == base || prefix.starts_with(&format!("{base}/")));
-                    if !within_a_base {
-                        ancestors.insert(prefix);
+        // render the base dirs as roots without further bookkeeping. The view's `hide_dirs`
+        // paths join the same set: their row is skipped and their children splice one level up.
+        let hidden_dir_paths: HashSet<String> = {
+            let mut hidden = HashSet::default();
+            if hide_root {
+                let base_dirs: Vec<String> = active_view
+                    .map(|view| {
+                        view.include
+                            .iter()
+                            .filter_map(|glob| glob_literal_base_dir(glob))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for base in &base_dirs {
+                    let components: Vec<&str> = base
+                        .split('/')
+                        .filter(|component| !component.is_empty())
+                        .collect();
+                    for prefix_len in 0..components.len() {
+                        let prefix = components[..prefix_len].join("/");
+                        // Don't hide a prefix that is itself a base dir or sits inside one: with
+                        // overlapping bases (e.g. `Assets/**` and `Assets/Scenes/Special/**`) the
+                        // intermediate `Assets/Scenes` must still render under the promoted `Assets`
+                        // rather than be skipped, which would misrepresent the on-disk hierarchy.
+                        let within_a_base = base_dirs
+                            .iter()
+                            .any(|base| &prefix == base || prefix.starts_with(&format!("{base}/")));
+                        if !within_a_base {
+                            hidden.insert(prefix);
+                        }
                     }
                 }
             }
-            ancestors
-        } else {
-            HashSet::default()
+            if let Some(view) = active_view {
+                hidden.extend(view.hide_dirs.iter().cloned());
+            }
+            hidden
         };
 
         // Kept on the foreground side of the spawn so the post-rebuild reconcile can re-test
@@ -4486,10 +4490,9 @@ impl ProjectPanel {
                         while let Some(entry) = entry_iter.entry() {
                             let is_worktree_root =
                                 Some(entry.entry) == worktree_snapshot.root_entry();
-                            if hide_root
-                                && (is_worktree_root
-                                    || view_root_ancestor_paths
-                                        .contains(entry.path.as_unix_str()))
+                            if (hide_root && is_worktree_root)
+                                || (!is_worktree_root
+                                    && hidden_dir_paths.contains(entry.path.as_unix_str()))
                             {
                                 if new_entry_parent_id == Some(entry.id) {
                                     visible_worktree_entries.push(Self::create_new_git_entry(

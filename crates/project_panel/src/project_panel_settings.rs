@@ -51,6 +51,9 @@ pub struct ProjectPanelView {
     /// `None` inherits the global `project_panel.hide_root`; `Some(false)` lets a
     /// view re-show the root even when the global setting hides it.
     pub hide_root: Option<bool>,
+    /// Literal worktree-relative paths of directories whose row is hidden in this view,
+    /// splicing their children one level up. Stored normalized (no leading/trailing `/`).
+    pub hide_dirs: Vec<String>,
 }
 
 /// The list of user-defined project panel views. Kept in its own settings type
@@ -188,6 +191,19 @@ impl Settings for ProjectPanelViewsSettings {
                 include: view.include.unwrap_or_default(),
                 exclude: view.exclude.unwrap_or_default(),
                 hide_root: view.hide_root,
+                hide_dirs: view
+                    .hide_dirs
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|dir| {
+                        let normalized = dir.trim_matches('/');
+                        if normalized.is_empty() {
+                            None
+                        } else {
+                            Some(normalized.to_string())
+                        }
+                    })
+                    .collect(),
             })
             .collect();
         Self { views }
