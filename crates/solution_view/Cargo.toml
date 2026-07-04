@@ -1,0 +1,29 @@
+[package]
+name = "solution_view"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/solution_view.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fs.workspace = true
+gpui.workspace = true
+log.workspace = true
+project.workspace = true
+project_panel.workspace = true
+quick-xml.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+util.workspace = true
+worktree.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

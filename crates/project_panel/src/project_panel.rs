@@ -6893,8 +6893,12 @@ impl ProjectPanel {
 
         let icon = if is_container {
             FileIcons::get_chevron_icon(is_expanded, cx)
+        } else if let Some(icon) = node.icon.clone() {
+            Some(icon)
+        } else if let Some(project_path) = &node.project_path {
+            FileIcons::get_icon(project_path.path.as_std_path(), cx)
         } else {
-            node.icon.clone()
+            None
         };
 
         let views_settings = Self::views_settings(&self.project, cx);
@@ -6902,6 +6906,7 @@ impl ProjectPanel {
             .resolved_view(views_settings, cx)
             .and_then(|view| view.provider.clone());
         let node_id = node.id.clone();
+        let node_project_path = node.project_path.clone();
 
         h_flex()
             .id(SharedString::from(format!("provider-entry-{}", node.id)))
@@ -6932,6 +6937,19 @@ impl ProjectPanel {
                             cx,
                         );
                     }))
+                },
+            )
+            .when_some(
+                node_project_path.filter(|_| !is_container),
+                |row, project_path| {
+                    row.cursor_pointer()
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            if let Ok(task) = this.workspace.update(cx, |workspace, cx| {
+                                workspace.open_path(project_path.clone(), None, true, window, cx)
+                            }) {
+                                task.detach_and_log_err(cx);
+                            }
+                        }))
                 },
             )
             .into_any_element()
