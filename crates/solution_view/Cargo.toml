@@ -26,4 +26,10 @@ util.workspace = true
 worktree.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

@@ -28,6 +28,10 @@ use crate::parse::{parse_csproj, parse_solution};
 /// `{ "name": "Solution", "provider": "solution" }` in settings.
 const PROVIDER_ID: &str = "solution";
 
+/// How many directory levels below the worktree root to search for `.sln` files. Solutions
+/// commonly live one level down (e.g. a Unity project folder), not at the very root.
+const MAX_SOLUTION_SEARCH_DEPTH: usize = 3;
+
 /// Registers the Solution Explorer provider. Call once at startup (see `zed::main`).
 pub fn init(cx: &mut App) {
     let registry = ProjectPanelViewProviderRegistry::default_global(cx);
@@ -117,7 +121,7 @@ impl WorktreeAccess {
         self.fs.load(&path).await
     }
 
-    /// Lists the direct children of `parent_rel`, skipping build output dirs. Returns
+    /// Lists the direct children of `parent_rel`, skipping build-output/tooling dirs. Returns
     /// `(file_name, is_dir, rel_path)` tuples read from the already-scanned worktree snapshot.
     fn list_dir(&self, parent_rel: &str, cx: &mut AsyncApp) -> Vec<(String, bool, String)> {
         cx.update(|cx| {
@@ -130,7 +134,7 @@ impl WorktreeAccess {
                 let Some(name) = entry.path.file_name() else {
                     continue;
                 };
-                if entry.is_dir() && is_build_output_dir(name) {
+                if entry.is_dir() && is_noise_dir(name) {
                     continue;
                 }
                 entries.push((
@@ -142,10 +146,50 @@ impl WorktreeAccess {
             entries
         })
     }
+
+    /// Searches the worktree (root plus a bounded depth of subdirectories, skipping build/tooling
+    /// dirs) for `.sln` files. Returns `(file_name, rel_path)` sorted by path for stable ordering.
+    fn find_solutions(&self, cx: &mut AsyncApp) -> Vec<(String, String)> {
+        cx.update(|cx| {
+            let snapshot = self.entity.read(cx).snapshot();
+            let mut solutions = Vec::new();
+            let root: std::sync::Arc<RelPath> = RelPath::empty().into();
+            let mut stack = vec![(root, 0usize)];
+            while let Some((dir, depth)) = stack.pop() {
+                for entry in snapshot.child_entries(dir.as_ref()) {
+                    let Some(name) = entry.path.file_name() else {
+                        continue;
+                    };
+                    if entry.is_dir() {
+                        if depth < MAX_SOLUTION_SEARCH_DEPTH && !is_solution_search_skip_dir(name) {
+                            stack.push((entry.path.clone(), depth + 1));
+                        }
+                    } else if has_extension(name, "sln") {
+                        solutions
+                            .push((name.to_string(), entry.path.as_unix_str().to_string()));
+                    }
+                }
+            }
+            solutions.sort_by(|left, right| left.1.cmp(&right.1));
+            solutions
+        })
+    }
 }
 
-fn is_build_output_dir(name: &str) -> bool {
-    matches!(name, "bin" | "obj")
+/// Build output and tooling directories hidden from a project's source tree.
+fn is_noise_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "bin" | "obj" | "Library" | "Temp" | "Logs" | "node_modules"
+    )
+}
+
+/// Directories not worth descending into when searching for solution files (build/tooling noise,
+/// large asset/package trees that never hold the main `.sln`, and dotfiles like `.git`/`.claude`).
+fn is_solution_search_skip_dir(name: &str) -> bool {
+    is_noise_dir(name)
+        || name.starts_with('.')
+        || matches!(name, "Assets" | "Packages" | "PackageCache" | "docs")
 }
 
 fn project_path(worktree_id: WorktreeId, rel: &str) -> Option<ProjectPath> {
@@ -197,31 +241,28 @@ fn leaf(
 }
 
 impl SolutionProvider {
-    /// Root nodes: one per `.sln` at the worktree root, or (fallback) top-level `.csproj` projects.
+    /// Root nodes: one per `.sln` found in the worktree, or (fallback) top-level `.csproj` projects.
     async fn root_nodes_impl(
         &self,
         access: WorktreeAccess,
         cx: &mut AsyncApp,
     ) -> Vec<ProjectPanelViewNode> {
         let worktree_id = access.worktree_id;
-        let root_entries = access.list_dir("", cx);
-        let solutions: Vec<_> = root_entries
-            .iter()
-            .filter(|(name, is_dir, _)| !is_dir && has_extension(name, "sln"))
-            .collect();
+        let solutions = access.find_solutions(cx);
         if !solutions.is_empty() {
             return solutions
                 .into_iter()
-                .map(|(name, _, rel)| {
-                    container(encode_id(NodeKind::Solution, worktree_id, rel), name.clone())
+                .map(|(name, rel)| {
+                    container(encode_id(NodeKind::Solution, worktree_id, &rel), name)
                 })
                 .collect();
         }
         // Fallback: no solution file, surface top-level projects directly.
-        root_entries
-            .iter()
+        access
+            .list_dir("", cx)
+            .into_iter()
             .filter(|(name, is_dir, _)| !is_dir && has_extension(name, "csproj"))
-            .map(|(name, _, rel)| project_node(worktree_id, name, rel))
+            .map(|(name, _, rel)| project_node(worktree_id, &name, &rel))
             .collect()
     }
 
@@ -392,5 +433,136 @@ impl ProjectPanelViewProvider for SolutionProvider {
     ) -> Subscription {
         // No push-based invalidation yet; the tree refreshes when the panel re-queries on expand.
         Subscription::new(|| {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{BorrowAppContext, TestAppContext};
+    use pretty_assertions::assert_eq;
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            // Scan everything (including Library/obj) so the provider's own noise filtering is exercised.
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_exclusions = Some(Vec::new());
+                });
+            });
+        });
+    }
+
+    /// A fixture mirroring the Aspid.FastTools layout: solutions nested one directory below the
+    /// worktree root, alongside Unity build noise (`Library`, `obj`) that must be hidden.
+    async fn fasttools_project(cx: &mut TestAppContext) -> Entity<Project> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": { "HEAD": "" },
+                "docs": { "readme.md": "" },
+                "Aspid.FastTools.Generators": {
+                    "Aspid.FastTools.Generators.sln":
+                        "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Aspid.FastTools.Generators\", \"Aspid.FastTools.Generators.csproj\", \"{1}\"\n",
+                    "Aspid.FastTools.Generators.csproj":
+                        "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"Microsoft.CodeAnalysis\" Version=\"4.0.0\" /></ItemGroup></Project>",
+                    "Generator.cs": "",
+                },
+                "Aspid.FastTools": {
+                    "Aspid.FastTools.sln":
+                        "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Aspid.FastTools\", \"Aspid.FastTools.csproj\", \"{1}\"\nProject(\"{2150E333-8FDC-42A3-9474-1A3956D46DE8}\") = \"Solution Items\", \"Solution Items\", \"{9}\"\n",
+                    "Aspid.FastTools.csproj":
+                        "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" /><ProjectReference Include=\"..\\Aspid.FastTools.Generators\\Aspid.FastTools.Generators.csproj\" /></ItemGroup></Project>",
+                    "Source": { "Foo.cs": "" },
+                    "Assets": { "Bar.cs": "" },
+                    "Library": { "ScriptAssemblies": { "x.dll": "" } },
+                    "obj": { "project.assets.json": "" },
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        cx.run_until_parked();
+        project
+    }
+
+    fn titles(nodes: &[ProjectPanelViewNode]) -> Vec<String> {
+        nodes.iter().map(|node| node.title.to_string()).collect()
+    }
+
+    #[gpui::test]
+    async fn discovers_nested_solutions(cx: &mut TestAppContext) {
+        let project = fasttools_project(cx).await;
+        let roots = SolutionProvider
+            .root_nodes(project, &cx.to_async())
+            .await
+            .unwrap();
+        // Both nested solutions found, sorted by path; the `docs`/`.git` dirs are skipped.
+        assert_eq!(
+            titles(&roots),
+            vec![
+                "Aspid.FastTools.Generators.sln".to_string(),
+                "Aspid.FastTools.sln".to_string(),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn expands_solution_project_and_dependencies(cx: &mut TestAppContext) {
+        let project = fasttools_project(cx).await;
+        let async_cx = cx.to_async();
+
+        let roots = SolutionProvider
+            .root_nodes(project.clone(), &async_cx)
+            .await
+            .unwrap();
+        let solution = roots
+            .iter()
+            .find(|node| node.title.as_ref() == "Aspid.FastTools.sln")
+            .cloned()
+            .expect("solution node");
+
+        // Solution folders (`Solution Items`) are skipped; only the real project remains.
+        let projects = SolutionProvider
+            .children(project.clone(), solution, &async_cx)
+            .await
+            .unwrap();
+        assert_eq!(titles(&projects), vec!["Aspid.FastTools".to_string()]);
+
+        let project_children = SolutionProvider
+            .children(project.clone(), projects[0].clone(), &async_cx)
+            .await
+            .unwrap();
+        let child_titles = titles(&project_children);
+        assert_eq!(child_titles.first().map(String::as_str), Some("Dependencies"));
+        assert!(child_titles.contains(&"Source".to_string()));
+        assert!(child_titles.contains(&"Assets".to_string()));
+        // Build-output noise is hidden from the source tree.
+        assert!(!child_titles.contains(&"Library".to_string()));
+        assert!(!child_titles.contains(&"obj".to_string()));
+
+        let dependencies = project_children
+            .into_iter()
+            .find(|node| node.title.as_ref() == "Dependencies")
+            .expect("dependencies node");
+        let deps = SolutionProvider
+            .children(project, dependencies, &async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&deps),
+            vec![
+                "Newtonsoft.Json (13.0.3)".to_string(),
+                "Aspid.FastTools.Generators".to_string(),
+            ]
+        );
     }
 }

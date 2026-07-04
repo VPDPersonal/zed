@@ -17226,9 +17226,11 @@ dependencies = [
  "project",
  "project_panel",
  "quick-xml 0.38.3",
+ "remote_connection",
  "serde_json",
  "settings",
  "util",
+ "workspace",
  "worktree",
 ]
 
