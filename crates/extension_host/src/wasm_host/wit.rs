@@ -31,7 +31,8 @@ use wasmtime::{
 #[cfg(test)]
 pub use latest::CodeLabelSpanLiteral;
 pub use latest::{
-    CodeLabel, CodeLabelSpan, Command, DebugAdapterBinary, ExtensionProject, Range, SlashCommand,
+    CodeLabel, CodeLabelSpan, Command, DebugAdapterBinary, ExtensionProject, ProjectPanelViewNode,
+    Range, SlashCommand,
     zed::extension::context_server::ContextServerConfiguration,
     zed::extension::lsp::{
         Completion, CompletionKind, CompletionLabelDetails, InsertTextFormat, Symbol, SymbolKind,
@@ -983,6 +984,57 @@ impl Extension {
             | Extension::V0_3_0(_)
             | Extension::V0_4_0(_) => {
                 anyhow::bail!("`context_server_configuration` not available prior to v0.5.0");
+            }
+        }
+    }
+
+    pub async fn call_project_panel_view_root_nodes(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: Arc<str>,
+        project: Resource<ExtensionProject>,
+    ) -> Result<Result<Vec<ProjectPanelViewNode>, String>> {
+        match self {
+            Extension::V0_8_0(ext) => {
+                ext.call_project_panel_view_root_nodes(store, &provider_id, project)
+                    .await
+            }
+            Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => {
+                anyhow::bail!("`project_panel_view_root_nodes` not available prior to v0.8.0");
+            }
+        }
+    }
+
+    pub async fn call_project_panel_view_children(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: Arc<str>,
+        project: Resource<ExtensionProject>,
+        parent: ProjectPanelViewNode,
+    ) -> Result<Result<Vec<ProjectPanelViewNode>, String>> {
+        match self {
+            Extension::V0_8_0(ext) => {
+                ext.call_project_panel_view_children(store, &provider_id, project, &parent)
+                    .await
+            }
+            Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => {
+                anyhow::bail!("`project_panel_view_children` not available prior to v0.8.0");
             }
         }
     }

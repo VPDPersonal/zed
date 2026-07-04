@@ -32,6 +32,7 @@ pub struct ExtensionHostProxy {
     context_server_proxy: RwLock<Option<Arc<dyn ExtensionContextServerProxy>>>,
     debug_adapter_provider_proxy: RwLock<Option<Arc<dyn ExtensionDebugAdapterProviderProxy>>>,
     language_model_provider_proxy: RwLock<Option<Arc<dyn ExtensionLanguageModelProviderProxy>>>,
+    project_panel_view_proxy: RwLock<Option<Arc<dyn ExtensionProjectPanelViewProxy>>>,
 }
 
 impl ExtensionHostProxy {
@@ -57,6 +58,7 @@ impl ExtensionHostProxy {
             context_server_proxy: RwLock::default(),
             debug_adapter_provider_proxy: RwLock::default(),
             language_model_provider_proxy: RwLock::default(),
+            project_panel_view_proxy: RwLock::default(),
         }
     }
 
@@ -82,6 +84,10 @@ impl ExtensionHostProxy {
 
     pub fn register_context_server_proxy(&self, proxy: impl ExtensionContextServerProxy) {
         self.context_server_proxy.write().replace(Arc::new(proxy));
+    }
+
+    pub fn register_project_panel_view_proxy(&self, proxy: impl ExtensionProjectPanelViewProxy) {
+        self.project_panel_view_proxy.write().replace(Arc::new(proxy));
     }
 
     pub fn register_debug_adapter_proxy(&self, proxy: impl ExtensionDebugAdapterProviderProxy) {
@@ -381,6 +387,40 @@ impl ExtensionContextServerProxy for ExtensionHostProxy {
         };
 
         proxy.unregister_context_server(server_id, cx)
+    }
+}
+
+pub trait ExtensionProjectPanelViewProxy: Send + Sync + 'static {
+    fn register_project_panel_view(
+        &self,
+        extension: Arc<dyn Extension>,
+        provider_id: Arc<str>,
+        cx: &mut App,
+    );
+
+    fn unregister_project_panel_view(&self, provider_id: Arc<str>, cx: &mut App);
+}
+
+impl ExtensionProjectPanelViewProxy for ExtensionHostProxy {
+    fn register_project_panel_view(
+        &self,
+        extension: Arc<dyn Extension>,
+        provider_id: Arc<str>,
+        cx: &mut App,
+    ) {
+        let Some(proxy) = self.project_panel_view_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.register_project_panel_view(extension, provider_id, cx)
+    }
+
+    fn unregister_project_panel_view(&self, provider_id: Arc<str>, cx: &mut App) {
+        let Some(proxy) = self.project_panel_view_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.unregister_project_panel_view(provider_id, cx)
     }
 }
 

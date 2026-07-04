@@ -118,6 +118,8 @@ pub struct ExtensionManifest {
     pub debug_locators: BTreeMap<Arc<str>, DebugLocatorManifestEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub language_model_providers: BTreeMap<Arc<str>, LanguageModelProviderManifestEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_panel_views: BTreeMap<Arc<str>, ProjectPanelViewManifestEntry>,
 }
 
 impl ExtensionManifest {
@@ -358,6 +360,9 @@ impl LanguageServerManifestEntry {
 pub struct ContextServerManifestEntry {}
 
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct ProjectPanelViewManifestEntry {}
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct SlashCommandManifestEntry {
     pub description: String,
     pub requires_argument: bool,
@@ -451,6 +456,7 @@ fn manifest_from_old_manifest(
         debug_adapters: Default::default(),
         debug_locators: Default::default(),
         language_model_providers: Default::default(),
+        project_panel_views: Default::default(),
     }
 }
 
@@ -485,6 +491,7 @@ mod tests {
             debug_adapters: Default::default(),
             debug_locators: Default::default(),
             language_model_providers: BTreeMap::default(),
+            project_panel_views: BTreeMap::default(),
         }
     }
 

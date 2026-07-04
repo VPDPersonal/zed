@@ -16,8 +16,8 @@ pub use serde_json;
 // that we may want to shadow to provide a cleaner Rust API.
 pub use wit::{
     CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars,
-    KeyValueStore, LanguageServerInstallationStatus, Project, Range, Worktree, download_file,
-    make_file_executable,
+    KeyValueStore, LanguageServerInstallationStatus, Project, ProjectPanelViewNode,
+    ProjectPanelViewPath, Range, Worktree, download_file, make_file_executable,
     zed::extension::context_server::ContextServerConfiguration,
     zed::extension::dap::{
         AttachRequest, BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate,
@@ -195,6 +195,25 @@ pub trait Extension: Send + Sync {
         _project: &Project,
     ) -> Result<Option<ContextServerConfiguration>> {
         Ok(None)
+    }
+
+    /// Returns the root nodes of the given project panel view provider's tree.
+    fn project_panel_view_root_nodes(
+        &mut self,
+        _provider_id: &str,
+        _project: &Project,
+    ) -> Result<Vec<ProjectPanelViewNode>> {
+        Err("`project_panel_view_root_nodes` not implemented".to_string())
+    }
+
+    /// Returns the children of the given node in a project panel view provider's tree.
+    fn project_panel_view_children(
+        &mut self,
+        _provider_id: &str,
+        _project: &Project,
+        _parent: ProjectPanelViewNode,
+    ) -> Result<Vec<ProjectPanelViewNode>> {
+        Err("`project_panel_view_children` not implemented".to_string())
     }
 
     /// Returns a list of package names as suggestions to be included in the
@@ -505,6 +524,21 @@ impl wit::Guest for Component {
     ) -> Result<Option<ContextServerConfiguration>, String> {
         let context_server_id = ContextServerId(context_server_id);
         extension().context_server_configuration(&context_server_id, project)
+    }
+
+    fn project_panel_view_root_nodes(
+        provider_id: String,
+        project: &Project,
+    ) -> Result<Vec<ProjectPanelViewNode>, String> {
+        extension().project_panel_view_root_nodes(&provider_id, project)
+    }
+
+    fn project_panel_view_children(
+        provider_id: String,
+        project: &Project,
+        parent: ProjectPanelViewNode,
+    ) -> Result<Vec<ProjectPanelViewNode>, String> {
+        extension().project_panel_view_children(&provider_id, project, parent)
     }
 
     fn suggest_docs_packages(provider: String) -> Result<Vec<String>, String> {

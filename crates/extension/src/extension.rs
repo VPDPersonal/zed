@@ -142,6 +142,19 @@ pub trait Extension: Send + Sync + 'static {
         project: Arc<dyn ProjectDelegate>,
     ) -> Result<Option<ContextServerConfiguration>>;
 
+    async fn project_panel_view_root_nodes(
+        &self,
+        provider_id: Arc<str>,
+        project: Arc<dyn ProjectDelegate>,
+    ) -> Result<Vec<ProjectPanelViewNode>>;
+
+    async fn project_panel_view_children(
+        &self,
+        provider_id: Arc<str>,
+        project: Arc<dyn ProjectDelegate>,
+        parent: ProjectPanelViewNode,
+    ) -> Result<Vec<ProjectPanelViewNode>>;
+
     async fn suggest_docs_packages(&self, provider: Arc<str>) -> Result<Vec<String>>;
 
     async fn index_docs(

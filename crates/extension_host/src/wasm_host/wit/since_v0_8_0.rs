@@ -542,6 +542,42 @@ impl TryFrom<ContextServerConfiguration> for extension::ContextServerConfigurati
     }
 }
 
+impl From<ProjectPanelViewPath> for extension::ProjectPanelViewPath {
+    fn from(value: ProjectPanelViewPath) -> Self {
+        Self {
+            worktree_id: value.worktree_id,
+            path: value.path,
+        }
+    }
+}
+
+impl From<ProjectPanelViewNode> for extension::ProjectPanelViewNode {
+    fn from(value: ProjectPanelViewNode) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            icon: value.icon,
+            is_container: value.is_container,
+            project_path: value.project_path.map(Into::into),
+        }
+    }
+}
+
+impl From<extension::ProjectPanelViewNode> for ProjectPanelViewNode {
+    fn from(value: extension::ProjectPanelViewNode) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            icon: value.icon,
+            is_container: value.is_container,
+            project_path: value.project_path.map(|path| ProjectPanelViewPath {
+                worktree_id: path.worktree_id,
+                path: path.path,
+            }),
+        }
+    }
+}
+
 impl HostKeyValueStore for WasmState {
     async fn insert(
         &mut self,

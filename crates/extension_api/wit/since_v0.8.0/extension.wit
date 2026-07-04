@@ -48,6 +48,22 @@ world extension {
         path: string,
     }
 
+    /// A worktree-relative location backing a project panel view node.
+    record project-panel-view-path {
+        worktree-id: u64,
+        path: string,
+    }
+
+    /// A single node in a provider-supplied project panel tree.
+    record project-panel-view-node {
+        id: string,
+        title: string,
+        icon: option<string>,
+        is-container: bool,
+        /// Absent for purely virtual nodes with no backing file (e.g. a "Dependencies" node).
+        project-path: option<project-panel-view-path>,
+    }
+
     import get-settings: func(path: option<settings-location>, category: string, key: option<string>) -> result<string, string>;
 
     /// Downloads a file from the given URL and saves it to the given path within the extension's
@@ -158,6 +174,12 @@ world extension {
 
     /// Returns the configuration for a context server.
     export context-server-configuration: func(context-server-id: string, project: borrow<project>) -> result<option<context-server-configuration>, string>;
+
+    /// Returns the root nodes of a project panel view provider's tree.
+    export project-panel-view-root-nodes: func(provider-id: string, project: borrow<project>) -> result<list<project-panel-view-node>, string>;
+
+    /// Returns the children of a node in a project panel view provider's tree.
+    export project-panel-view-children: func(provider-id: string, project: borrow<project>, parent: project-panel-view-node) -> result<list<project-panel-view-node>, string>;
 
     /// Returns a list of packages as suggestions to be included in the `/docs`
     /// search results.

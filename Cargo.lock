@@ -14093,6 +14093,7 @@ dependencies = [
  "command_palette_hooks",
  "criterion",
  "editor",
+ "extension",
  "feature_flags",
  "file_icons",
  "fs",

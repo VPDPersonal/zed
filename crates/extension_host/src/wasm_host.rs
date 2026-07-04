@@ -394,6 +394,50 @@ impl extension::Extension for WasmExtension {
         .await?
     }
 
+    async fn project_panel_view_root_nodes(
+        &self,
+        provider_id: Arc<str>,
+        project: Arc<dyn ProjectDelegate>,
+    ) -> Result<Vec<extension::ProjectPanelViewNode>> {
+        self.call(|extension, store| {
+            async move {
+                let project_resource = store.data_mut().table.push(project)?;
+                let nodes = extension
+                    .call_project_panel_view_root_nodes(store, provider_id.clone(), project_resource)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))?;
+                anyhow::Ok(nodes.into_iter().map(Into::into).collect())
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn project_panel_view_children(
+        &self,
+        provider_id: Arc<str>,
+        project: Arc<dyn ProjectDelegate>,
+        parent: extension::ProjectPanelViewNode,
+    ) -> Result<Vec<extension::ProjectPanelViewNode>> {
+        self.call(|extension, store| {
+            async move {
+                let project_resource = store.data_mut().table.push(project)?;
+                let nodes = extension
+                    .call_project_panel_view_children(
+                        store,
+                        provider_id.clone(),
+                        project_resource,
+                        parent.into(),
+                    )
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))?;
+                anyhow::Ok(nodes.into_iter().map(Into::into).collect())
+            }
+            .boxed()
+        })
+        .await?
+    }
+
     async fn suggest_docs_packages(&self, provider: Arc<str>) -> Result<Vec<String>> {
         self.call(|extension, store| {
             async move {

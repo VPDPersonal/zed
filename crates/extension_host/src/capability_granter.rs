@@ -113,6 +113,7 @@ mod tests {
             debug_adapters: Default::default(),
             debug_locators: Default::default(),
             language_model_providers: BTreeMap::default(),
+            project_panel_views: BTreeMap::default(),
         }
     }
 
