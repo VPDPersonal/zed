@@ -1,4 +1,5 @@
 pub mod project_panel_settings;
+pub mod project_panel_view_provider;
 mod undo;
 mod utils;
 
@@ -41,6 +42,7 @@ use project::{
     project_settings::GoToDiagnosticSeverityFilter,
 };
 use project_panel_settings::{ProjectPanelSettings, ProjectPanelView, ProjectPanelViewsSettings};
+use project_panel_view_provider::{ProjectPanelViewNode, ProjectPanelViewProviderRegistry};
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -106,11 +108,26 @@ struct State {
     /// project entries (and all non-leaf nodes are guaranteed to be directories).
     ancestors: HashMap<ProjectEntryId, FoldedAncestors>,
     visible_entries: Vec<VisibleEntriesForWorktree>,
+    /// Flattened tree for the active view when it is provider-backed (`ProjectPanelView::provider`
+    /// is set). `None` when the active view filters the worktree via glob, in which case
+    /// `visible_entries` above is the source of truth.
+    provider_entries: Option<Vec<ProviderEntryDetails>>,
     max_width_item_index: Option<usize>,
     edit_state: Option<EditState>,
     temporarily_unfolded_pending_state: Option<TemporaryUnfoldedPendingState>,
     unfolded_dir_ids: HashSet<ProjectEntryId>,
     expanded_dir_ids: HashMap<WorktreeId, Vec<ProjectEntryId>>,
+    /// Expanded container node ids per provider id, keyed independently of `expanded_dir_ids`
+    /// since provider nodes are identified by `SharedString`, not `ProjectEntryId`.
+    provider_expanded_ids: HashMap<Arc<str>, HashSet<SharedString>>,
+}
+
+/// A flattened row of a provider-supplied project panel tree, ready for rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderEntryDetails {
+    node: ProjectPanelViewNode,
+    depth: usize,
+    is_expanded: bool,
 }
 
 impl State {
@@ -126,11 +143,13 @@ impl State {
             last_worktree_root_id: None,
             ancestors: Default::default(),
             visible_entries: Default::default(),
+            provider_entries: None,
             max_width_item_index: None,
             edit_state: old.edit_state.clone(),
             temporarily_unfolded_pending_state: None,
             unfolded_dir_ids: old.unfolded_dir_ids.clone(),
             expanded_dir_ids: old.expanded_dir_ids.clone(),
+            provider_expanded_ids: old.provider_expanded_ids.clone(),
         }
     }
 }
@@ -706,6 +725,21 @@ fn build_view_matcher(globs: &[String]) -> Option<PathMatcher> {
     PathMatcher::new(valid, PathStyle::Posix).log_err()
 }
 
+/// Identifies a view across settings edits: by provider id for provider-backed views (stable
+/// even if the user renames the tab's display name), by name for glob-filtered views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ViewIdentity {
+    Name(SharedString),
+    Provider(SharedString),
+}
+
+fn view_identity(view: &ProjectPanelView) -> ViewIdentity {
+    match &view.provider {
+        Some(provider_id) => ViewIdentity::Provider(provider_id.clone()),
+        None => ViewIdentity::Name(view.name.clone()),
+    }
+}
+
 /// Whether an entry passes the active view's include/exclude filter. Directories bypass
 /// `include` so the tree structure is preserved (empty directories are pruned separately). An
 /// entry is excluded when it or any ancestor matches `exclude`, so excluding a directory hides
@@ -919,22 +953,30 @@ impl ProjectPanel {
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let new_views = Self::views_settings(&this.project, cx).clone();
                 if project_panel_views != new_views {
-                    // Preserve the active view across settings edits by matching its name, so
-                    // reordering or inserting views doesn't silently switch which one is active.
-                    // Prefer the same index when its name is unchanged, so duplicate view names
-                    // (which only the first would otherwise match) don't snap to the wrong tab on
-                    // an unrelated edit.
-                    let active_name = project_panel_views
+                    // Preserve the active view across settings edits by matching its identity
+                    // (provider id, or name for glob views), so reordering or inserting views
+                    // doesn't silently switch which one is active. Prefer the same index when
+                    // its identity is unchanged, so duplicate view names (which only the first
+                    // would otherwise match) don't snap to the wrong tab on an unrelated edit.
+                    let active_identity = project_panel_views
                         .views
                         .get(this.active_view)
-                        .map(|view| view.name.clone());
-                    let same_index_matches = active_name.as_ref().is_some_and(|name| {
-                        new_views.views.get(this.active_view).map(|view| &view.name) == Some(name)
+                        .map(view_identity);
+                    let same_index_matches = active_identity.as_ref().is_some_and(|identity| {
+                        new_views
+                            .views
+                            .get(this.active_view)
+                            .map(view_identity)
+                            .as_ref()
+                            == Some(identity)
                     });
                     if !same_index_matches {
-                        this.active_view = active_name
-                            .and_then(|name| {
-                                new_views.views.iter().position(|view| view.name == name)
+                        this.active_view = active_identity
+                            .and_then(|identity| {
+                                new_views
+                                    .views
+                                    .iter()
+                                    .position(|view| view_identity(view) == identity)
                             })
                             .unwrap_or_else(|| {
                                 this.active_view.min(new_views.views.len().saturating_sub(1))
@@ -1004,9 +1046,11 @@ impl ProjectPanel {
                     temporarily_unfolded_pending_state: None,
                     last_worktree_root_id: Default::default(),
                     visible_entries: Default::default(),
+                    provider_entries: None,
                     ancestors: Default::default(),
                     expanded_dir_ids: Default::default(),
                     unfolded_dir_ids: Default::default(),
+                    provider_expanded_ids: Default::default(),
                 },
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
@@ -4375,6 +4419,16 @@ impl ProjectPanel {
 
         let views_settings = Self::views_settings(&self.project, cx);
         let active_view = self.resolved_view(views_settings, cx);
+        if let Some(provider_id) = active_view.and_then(|view| view.provider.clone()) {
+            self.update_provider_visible_entries(
+                provider_id,
+                focus_filename_editor,
+                autoscroll,
+                window,
+                cx,
+            );
+            return;
+        }
         let view_include = active_view.and_then(|view| {
             if view.include.is_empty() {
                 return None;
@@ -4873,6 +4927,129 @@ impl ProjectPanel {
                 || self.update_visible_entries_task.focus_filename_editor,
             autoscroll: autoscroll || self.update_visible_entries_task.autoscroll,
         };
+    }
+
+    /// Rebuilds `state.provider_entries` by querying the registered provider for the active
+    /// view, flattening its tree depth-first for every currently-expanded container. Mirrors
+    /// the shape of `update_visible_entries`'s background rebuild, but the provider is queried
+    /// directly rather than walking a worktree snapshot, since providers are async by contract
+    /// (see `ProjectPanelViewProvider`) to accommodate a future WASM extension implementation.
+    fn update_provider_visible_entries(
+        &mut self,
+        provider_id: SharedString,
+        focus_filename_editor: bool,
+        autoscroll: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.project.clone();
+        let provider = ProjectPanelViewProviderRegistry::default_global(cx)
+            .read(cx)
+            .provider(&provider_id);
+        let expanded_ids = self
+            .state
+            .provider_expanded_ids
+            .get(provider_id.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
+            let Some(provider) = provider else {
+                this.update_in(cx, |this, _window, cx| {
+                    this.state.provider_entries = Some(Vec::new());
+                    this.state.visible_entries = Vec::new();
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+
+            let root_nodes = match provider.root_nodes(project.clone(), cx).await {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    log::error!(
+                        "failed to load root nodes for project panel view provider {provider_id}: {error}"
+                    );
+                    Vec::new()
+                }
+            };
+
+            // Depth-first flatten, expanding only containers already marked expanded.
+            let mut flattened = Vec::new();
+            let mut stack: Vec<(ProjectPanelViewNode, usize)> = root_nodes
+                .into_iter()
+                .rev()
+                .map(|node| (node, 0))
+                .collect();
+            while let Some((node, depth)) = stack.pop() {
+                let node_is_expanded = expanded_ids.contains(&node.id);
+                let node_is_container = node.is_container;
+                let node_for_children = node.clone();
+                flattened.push(ProviderEntryDetails {
+                    node,
+                    depth,
+                    is_expanded: node_is_expanded,
+                });
+                if node_is_container && node_is_expanded {
+                    match provider
+                        .children(project.clone(), node_for_children, cx)
+                        .await
+                    {
+                        Ok(children) => {
+                            for child in children.into_iter().rev() {
+                                stack.push((child, depth + 1));
+                            }
+                        }
+                        Err(error) => log::error!(
+                            "failed to load children for project panel view provider {provider_id}: {error}"
+                        ),
+                    }
+                }
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                this.state.provider_entries = Some(flattened);
+                this.state.visible_entries = Vec::new();
+                if this.update_visible_entries_task.focus_filename_editor {
+                    this.update_visible_entries_task.focus_filename_editor = false;
+                    this.filename_editor.update(cx, |editor, cx| {
+                        window.focus(&editor.focus_handle(cx), cx);
+                    });
+                }
+                if this.update_visible_entries_task.autoscroll {
+                    this.update_visible_entries_task.autoscroll = false;
+                    this.autoscroll(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+
+        self.update_visible_entries_task = UpdateVisibleEntriesTask {
+            _visible_entries_task: visible_entries_task,
+            focus_filename_editor: focus_filename_editor
+                || self.update_visible_entries_task.focus_filename_editor,
+            autoscroll: autoscroll || self.update_visible_entries_task.autoscroll,
+        };
+    }
+
+    /// Toggles a provider container node's expanded state and rebuilds the provider tree.
+    fn toggle_provider_entry_expanded(
+        &mut self,
+        provider_id: Arc<str>,
+        node_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded_ids = self
+            .state
+            .provider_expanded_ids
+            .entry(provider_id)
+            .or_default();
+        if !expanded_ids.remove(&node_id) {
+            expanded_ids.insert(node_id);
+        }
+        self.update_visible_entries(None, false, false, window, cx);
     }
 
     fn expand_entry(
@@ -6695,6 +6872,69 @@ impl ProjectPanel {
         })
     }
 
+    /// Renders one row of a provider-backed view's tree. Deliberately minimal (no
+    /// selection/marks/diagnostics/drag-drop): those concepts apply to files backed by
+    /// `ProjectPath`, which provider nodes may not have (see `ProjectPanelViewNode`), and will
+    /// be designed alongside the first real provider rather than speculatively here.
+    fn render_provider_entry(
+        &self,
+        details: &ProviderEntryDetails,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let settings = ProjectPanelSettings::get_global(cx);
+        let indent = px(details.depth as f32 * settings.indent_size);
+        let node = details.node.clone();
+        let is_container = node.is_container;
+        let is_expanded = details.is_expanded;
+        let item_colors = get_item_color(false, cx);
+
+        let icon = if is_container {
+            FileIcons::get_chevron_icon(is_expanded, cx)
+        } else {
+            node.icon.clone()
+        };
+
+        let views_settings = Self::views_settings(&self.project, cx);
+        let provider_id = self
+            .resolved_view(views_settings, cx)
+            .and_then(|view| view.provider.clone());
+        let node_id = node.id.clone();
+
+        h_flex()
+            .id(SharedString::from(format!("provider-entry-{}", node.id)))
+            .w_full()
+            .h_6()
+            .pl(indent)
+            .items_center()
+            .gap_1()
+            .bg(item_colors.default)
+            .hover(|style| style.bg(item_colors.hover))
+            .child(if let Some(icon) = icon {
+                h_flex().child(Icon::from_path(icon).color(Color::Muted))
+            } else {
+                h_flex()
+                    .size(IconSize::default().rems())
+                    .invisible()
+                    .flex_none()
+            })
+            .child(Label::new(node.title).single_line())
+            .when_some(
+                provider_id.filter(|_| is_container),
+                |row, provider_id| {
+                    row.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.toggle_provider_entry_expanded(
+                            Arc::from(provider_id.as_ref()),
+                            node_id.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+                },
+            )
+            .into_any_element()
+    }
+
     fn render_entry_path_separator(
         &self,
         entry_id: ProjectEntryId,
@@ -7308,7 +7548,8 @@ impl ProjectPanel {
 
 impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_worktree = !self.state.visible_entries.is_empty();
+        let has_worktree =
+            !self.state.visible_entries.is_empty() || self.state.provider_entries.is_some();
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
@@ -7327,12 +7568,15 @@ impl Render for ProjectPanel {
         let is_local = project.is_local();
 
         if has_worktree {
-            let item_count = self
-                .state
-                .visible_entries
-                .iter()
-                .map(|worktree| worktree.entries.len())
-                .sum();
+            let item_count = if let Some(provider_entries) = &self.state.provider_entries {
+                provider_entries.len()
+            } else {
+                self.state
+                    .visible_entries
+                    .iter()
+                    .map(|worktree| worktree.entries.len())
+                    .sum()
+            };
 
             fn handle_drag_move<T: 'static>(
                 this: &mut ProjectPanel,
@@ -7493,22 +7737,37 @@ impl Render for ProjectPanel {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
                                     this.rendered_entries_len = range.end - range.start;
                                     let mut items = Vec::with_capacity(this.rendered_entries_len);
-                                    let marked_selections: Arc<[SelectedEntry]> =
-                                        Arc::from(this.marked_entries.clone());
-                                    this.for_each_visible_entry(
-                                        range,
-                                        window,
-                                        cx,
-                                        &mut |id, details, window, cx| {
-                                            items.push(this.render_entry(
-                                                id,
-                                                details,
-                                                Arc::clone(&marked_selections),
-                                                window,
-                                                cx,
-                                            ));
-                                        },
-                                    );
+                                    if let Some(provider_entries) =
+                                        this.state.provider_entries.clone()
+                                    {
+                                        for details in
+                                            provider_entries.get(range).unwrap_or(&[])
+                                        {
+                                            items.push(
+                                                this.render_provider_entry(details, window, cx),
+                                            );
+                                        }
+                                    } else {
+                                        let marked_selections: Arc<[SelectedEntry]> =
+                                            Arc::from(this.marked_entries.clone());
+                                        this.for_each_visible_entry(
+                                            range,
+                                            window,
+                                            cx,
+                                            &mut |id, details, window, cx| {
+                                                items.push(
+                                                    this.render_entry(
+                                                        id,
+                                                        details,
+                                                        Arc::clone(&marked_selections),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                    .into_any_element(),
+                                                );
+                                            },
+                                        );
+                                    }
                                     items
                                 })
                             })

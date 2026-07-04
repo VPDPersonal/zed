@@ -44,6 +44,10 @@ pub struct ProjectPanelSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectPanelView {
     pub name: SharedString,
+    /// Id of a registered project panel view provider. When set, this view is rendered by
+    /// that provider's own tree instead of filtering the worktree via glob; `include`,
+    /// `exclude`, and `hide_dirs` are ignored for this view.
+    pub provider: Option<SharedString>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     /// Whether to hide the worktree root in this view, promoting its top-level
@@ -188,6 +192,7 @@ impl Settings for ProjectPanelViewsSettings {
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| format!("View {}", index + 1))
                     .into(),
+                provider: view.provider.map(Into::into),
                 include: view.include.unwrap_or_default(),
                 exclude: view.exclude.unwrap_or_default(),
                 hide_root: view.hide_root,

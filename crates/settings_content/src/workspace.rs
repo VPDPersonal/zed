@@ -720,6 +720,12 @@ pub struct ProjectPanelAutoOpenSettings {
 pub struct ProjectPanelViewSettingsContent {
     /// Display name of the view, shown in its tab.
     pub name: Option<String>,
+    /// Id of a registered project panel view provider. When set, this view is rendered by
+    /// that provider's own tree instead of filtering the worktree via glob; `include`,
+    /// `exclude`, and `hide_dirs` are ignored for this view.
+    ///
+    /// Default: unset (glob-filtered view)
+    pub provider: Option<String>,
     /// Glob patterns of files to show in this view. When empty, all files are shown.
     /// Patterns are matched case-sensitively against worktree-relative paths, with the same
     /// semantics as `file_scan_exclusions`: a bare name like `bin` matches at any depth, so
