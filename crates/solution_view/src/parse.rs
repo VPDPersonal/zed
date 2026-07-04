@@ -45,13 +45,20 @@ pub fn parse_solution(text: &str) -> Vec<SolutionProject> {
 /// References extracted from a `.csproj` file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsprojInfo {
+    /// Whether the project uses an MSBuild SDK (`<Project Sdk="...">`). SDK-style projects
+    /// compile their directory tree via implicit globs; legacy projects (e.g. Unity-generated
+    /// ones) list every file explicitly in [`Self::compile_items`].
+    pub is_sdk_style: bool,
     /// NuGet package references as `(name, version)`; version is absent when not specified inline.
     pub package_references: Vec<(String, Option<String>)>,
     /// Worktree-relative (to the `.csproj`) paths of referenced projects, normalized to `/`.
     pub project_references: Vec<String>,
+    /// Explicit `<Compile Include>`/`<None Include>` item paths (relative to the `.csproj`),
+    /// normalized to `/`. Empty for SDK-style projects that rely on implicit globs.
+    pub compile_items: Vec<String>,
 }
 
-/// Parses `PackageReference`/`ProjectReference` elements out of a `.csproj` file.
+/// Parses `PackageReference`/`ProjectReference`/`Compile`/`None` elements out of a `.csproj` file.
 pub fn parse_csproj(text: &str) -> CsprojInfo {
     let mut info = CsprojInfo::default();
     let mut reader = Reader::from_str(text);
@@ -62,6 +69,11 @@ pub fn parse_csproj(text: &str) -> CsprojInfo {
             Ok(Event::Start(element) | Event::Empty(element)) => {
                 let tag = element.name();
                 match tag.as_ref() {
+                    b"Project" => {
+                        if attribute_value(&element, b"Sdk").is_some() {
+                            info.is_sdk_style = true;
+                        }
+                    }
                     b"PackageReference" => {
                         if let Some(name) = attribute_value(&element, b"Include") {
                             let version = attribute_value(&element, b"Version");
@@ -71,6 +83,12 @@ pub fn parse_csproj(text: &str) -> CsprojInfo {
                     b"ProjectReference" => {
                         if let Some(include) = attribute_value(&element, b"Include") {
                             info.project_references.push(normalize_separators(&include));
+                        }
+                    }
+                    // `Include`-less `Compile`/`None` elements (`Remove`/`Update` operations) are skipped.
+                    b"Compile" | b"None" => {
+                        if let Some(include) = attribute_value(&element, b"Include") {
+                            info.compile_items.push(normalize_separators(&include));
                         }
                     }
                     _ => {}
@@ -184,6 +202,7 @@ EndGlobal
 </Project>
 "#;
         let info = parse_csproj(csproj);
+        assert!(info.is_sdk_style);
         assert_eq!(
             info.package_references,
             vec![
@@ -192,6 +211,32 @@ EndGlobal
             ]
         );
         assert_eq!(info.project_references, vec!["../Core/Core.csproj".to_string()]);
+        assert!(info.compile_items.is_empty());
+    }
+
+    #[test]
+    fn parses_legacy_csproj_compile_items() {
+        let csproj = r#"
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Compile Include="Assets\Scripts\Player.cs" />
+    <Compile Include="Assets\Scripts\Enemy.cs" />
+    <None Include="Packages\tech.aspid.fasttools\package.json" />
+    <Compile Remove="Assets\Scripts\Old.cs" />
+    <Reference Include="UnityEngine" />
+  </ItemGroup>
+</Project>
+"#;
+        let info = parse_csproj(csproj);
+        assert!(!info.is_sdk_style);
+        assert_eq!(
+            info.compile_items,
+            vec![
+                "Assets/Scripts/Player.cs".to_string(),
+                "Assets/Scripts/Enemy.cs".to_string(),
+                "Packages/tech.aspid.fasttools/package.json".to_string(),
+            ]
+        );
     }
 
     #[test]

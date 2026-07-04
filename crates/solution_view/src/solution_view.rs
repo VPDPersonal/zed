@@ -51,8 +51,11 @@ enum NodeKind {
     Project,
     /// The virtual "Dependencies" node of a project; children are package/project references. `rel` is the `.csproj` path.
     Dependencies,
-    /// A directory in a project's source tree; children are its entries. `rel` is the directory path.
+    /// A directory in an SDK-style project's source tree; children are its entries. `rel` is the directory path.
     Directory,
+    /// A virtual directory of a legacy project's explicit compile-item tree; `rel` is
+    /// `csproj_rel|subdir` (the owning project plus the csproj-relative directory).
+    ItemDirectory,
 }
 
 impl NodeKind {
@@ -62,6 +65,7 @@ impl NodeKind {
             NodeKind::Project => "proj",
             NodeKind::Dependencies => "deps",
             NodeKind::Directory => "dir",
+            NodeKind::ItemDirectory => "itemdir",
         }
     }
 }
@@ -180,7 +184,7 @@ impl WorktreeAccess {
 fn is_noise_dir(name: &str) -> bool {
     matches!(
         name,
-        "bin" | "obj" | "Library" | "Temp" | "Logs" | "node_modules"
+        "bin" | "obj" | ".vs" | ".idea" | "Library" | "Temp" | "Logs" | "node_modules"
     )
 }
 
@@ -292,7 +296,16 @@ impl SolutionProvider {
                     encode_id(NodeKind::Dependencies, worktree_id, rel),
                     "Dependencies",
                 )];
-                nodes.extend(dir_nodes(worktree_id, &parent_dir(rel), &access, cx));
+                let text = access.load(rel).await?;
+                let info = parse_csproj(&text);
+                if info.is_sdk_style {
+                    nodes.extend(dir_nodes(worktree_id, &parent_dir(rel), &access, cx));
+                } else {
+                    // Legacy projects (e.g. Unity-generated) share one directory with every other
+                    // project of the solution, so their tree is built from explicit compile items
+                    // rather than a directory listing.
+                    nodes.extend(item_nodes(worktree_id, rel, &info.compile_items, ""));
+                }
                 Ok(nodes)
             }
             "deps" => {
@@ -326,6 +339,19 @@ impl SolutionProvider {
                 Ok(nodes)
             }
             "dir" => Ok(dir_nodes(worktree_id, rel, &access, cx)),
+            "itemdir" => {
+                let Some((csproj_rel, subdir)) = rel.split_once('|') else {
+                    return Ok(Vec::new());
+                };
+                let text = access.load(csproj_rel).await?;
+                let info = parse_csproj(&text);
+                Ok(item_nodes(
+                    worktree_id,
+                    csproj_rel,
+                    &info.compile_items,
+                    subdir,
+                ))
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -339,7 +365,8 @@ fn project_node(worktree_id: WorktreeId, name: &str, csproj_rel: &str) -> Projec
 }
 
 /// Directory listing as nodes: subdirectories become `dir` containers, files become leaves
-/// carrying a `ProjectPath` so a click opens them.
+/// carrying a `ProjectPath` so a click opens them. Solution/project files are hidden — they are
+/// already represented by their own tree nodes.
 fn dir_nodes(
     worktree_id: WorktreeId,
     dir_rel: &str,
@@ -349,6 +376,9 @@ fn dir_nodes(
     access
         .list_dir(dir_rel, cx)
         .into_iter()
+        .filter(|(name, is_dir, _)| {
+            *is_dir || !(has_extension(name, "csproj") || has_extension(name, "sln"))
+        })
         .map(|(name, is_dir, rel)| {
             if is_dir {
                 container(encode_id(NodeKind::Directory, worktree_id, &rel), name)
@@ -361,6 +391,66 @@ fn dir_nodes(
             }
         })
         .collect()
+}
+
+/// One level of a legacy project's virtual tree, derived from its explicit compile-item paths.
+/// `prefix` is the csproj-relative directory being expanded (empty for the project root).
+/// Directories come first, each group sorted case-insensitively.
+fn item_nodes(
+    worktree_id: WorktreeId,
+    csproj_rel: &str,
+    items: &[String],
+    prefix: &str,
+) -> Vec<ProjectPanelViewNode> {
+    let base = parent_dir(csproj_rel);
+    let mut directories = Vec::new();
+    let mut files: Vec<(String, String)> = Vec::new();
+    for item in items {
+        let remainder = if prefix.is_empty() {
+            item.as_str()
+        } else {
+            match item.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/')) {
+                Some(rest) => rest,
+                None => continue,
+            }
+        };
+        match remainder.split_once('/') {
+            Some((head, _)) => {
+                if !directories.iter().any(|existing| existing == head) {
+                    directories.push(head.to_string());
+                }
+            }
+            None => {
+                if !remainder.is_empty() {
+                    files.push((remainder.to_string(), item.clone()));
+                }
+            }
+        }
+    }
+    directories.sort_by_key(|name| name.to_lowercase());
+    files.sort_by_key(|(name, _)| name.to_lowercase());
+
+    let mut nodes = Vec::new();
+    for name in directories {
+        let subdir = join_rel(prefix, &name);
+        nodes.push(container(
+            encode_id(
+                NodeKind::ItemDirectory,
+                worktree_id,
+                &format!("{csproj_rel}|{subdir}"),
+            ),
+            name,
+        ));
+    }
+    for (name, item) in files {
+        let target = normalize_project_reference(&base, &item);
+        nodes.push(leaf(
+            format!("item|{csproj_rel}|{item}").into(),
+            name,
+            project_path(worktree_id, &target),
+        ));
+    }
+    nodes
 }
 
 /// Resolves a `..`-relative `ProjectReference` path against the referencing project's directory,
@@ -479,8 +569,9 @@ mod tests {
                 "Aspid.FastTools": {
                     "Aspid.FastTools.sln":
                         "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Aspid.FastTools\", \"Aspid.FastTools.csproj\", \"{1}\"\nProject(\"{2150E333-8FDC-42A3-9474-1A3956D46DE8}\") = \"Solution Items\", \"Solution Items\", \"{9}\"\n",
+                    // Legacy Unity-style project: no `Sdk` attribute, explicit compile items.
                     "Aspid.FastTools.csproj":
-                        "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" /><ProjectReference Include=\"..\\Aspid.FastTools.Generators\\Aspid.FastTools.Generators.csproj\" /></ItemGroup></Project>",
+                        "<Project ToolsVersion=\"4.0\"><ItemGroup><Compile Include=\"Source\\Foo.cs\" /><Compile Include=\"Assets\\Bar.cs\" /><PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" /><ProjectReference Include=\"..\\Aspid.FastTools.Generators\\Aspid.FastTools.Generators.csproj\" /></ItemGroup></Project>",
                     "Source": { "Foo.cs": "" },
                     "Assets": { "Bar.cs": "" },
                     "Library": { "ScriptAssemblies": { "x.dll": "" } },
@@ -537,17 +628,40 @@ mod tests {
             .unwrap();
         assert_eq!(titles(&projects), vec!["Aspid.FastTools".to_string()]);
 
+        // A legacy Unity-style project shows only its explicit compile items (as virtual
+        // directories), not the shared directory next to the `.sln` with every other project.
         let project_children = SolutionProvider
             .children(project.clone(), projects[0].clone(), &async_cx)
             .await
             .unwrap();
-        let child_titles = titles(&project_children);
-        assert_eq!(child_titles.first().map(String::as_str), Some("Dependencies"));
-        assert!(child_titles.contains(&"Source".to_string()));
-        assert!(child_titles.contains(&"Assets".to_string()));
-        // Build-output noise is hidden from the source tree.
-        assert!(!child_titles.contains(&"Library".to_string()));
-        assert!(!child_titles.contains(&"obj".to_string()));
+        assert_eq!(
+            titles(&project_children),
+            vec![
+                "Dependencies".to_string(),
+                "Assets".to_string(),
+                "Source".to_string(),
+            ]
+        );
+
+        let assets = project_children
+            .iter()
+            .find(|node| node.title.as_ref() == "Assets")
+            .cloned()
+            .expect("assets node");
+        let assets_children = SolutionProvider
+            .children(project.clone(), assets, &async_cx)
+            .await
+            .unwrap();
+        assert_eq!(titles(&assets_children), vec!["Bar.cs".to_string()]);
+        assert_eq!(
+            assets_children[0].project_path,
+            project_path(
+                project.read_with(&async_cx, |project, cx| {
+                    project.visible_worktrees(cx).next().unwrap().read(cx).id()
+                }),
+                "Aspid.FastTools/Assets/Bar.cs",
+            ),
+        );
 
         let dependencies = project_children
             .into_iter()
@@ -563,6 +677,41 @@ mod tests {
                 "Newtonsoft.Json (13.0.3)".to_string(),
                 "Aspid.FastTools.Generators".to_string(),
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn sdk_project_lists_its_directory_without_project_files(cx: &mut TestAppContext) {
+        let project = fasttools_project(cx).await;
+        let async_cx = cx.to_async();
+
+        let roots = SolutionProvider
+            .root_nodes(project.clone(), &async_cx)
+            .await
+            .unwrap();
+        let solution = roots
+            .iter()
+            .find(|node| node.title.as_ref() == "Aspid.FastTools.Generators.sln")
+            .cloned()
+            .expect("generators solution node");
+        let projects = SolutionProvider
+            .children(project.clone(), solution, &async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&projects),
+            vec!["Aspid.FastTools.Generators".to_string()]
+        );
+
+        // SDK-style projects list their directory, minus `.sln`/`.csproj` entries which are
+        // already represented by the solution/project nodes themselves.
+        let children = SolutionProvider
+            .children(project, projects[0].clone(), &async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&children),
+            vec!["Dependencies".to_string(), "Generator.cs".to_string()]
         );
     }
 }
