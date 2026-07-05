@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockSide, ProjectPanelEntrySpacing, ProjectPanelSortMode, ProjectPanelSortOrder,
-    RegisterSetting, Settings, ShowDiagnostics, ShowIndentGuides,
+    ProjectPanelViewSelector, RegisterSetting, Settings, ShowDiagnostics, ShowIndentGuides,
 };
 use ui::{
     px,
@@ -38,6 +38,7 @@ pub struct ProjectPanelSettings {
     pub sort_order: ProjectPanelSortOrder,
     pub diagnostic_badges: bool,
     pub git_status_indicator: bool,
+    pub view_selector: ProjectPanelViewSelector,
 }
 
 /// A single resolved project panel view: a named filter over the worktree tree.
@@ -48,6 +49,10 @@ pub struct ProjectPanelView {
     /// that provider's own tree instead of filtering the worktree via glob; `include`,
     /// `exclude`, and `hide_dirs` are ignored for this view.
     pub provider: Option<SharedString>,
+    /// Optional group name. Views sharing a group are presented together as one selector
+    /// cluster in the panel header; views without a group share a single default cluster.
+    /// Grouping only affects presentation — one view is active at a time.
+    pub group: Option<SharedString>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     /// Whether to hide the worktree root in this view, promoting its top-level
@@ -173,6 +178,7 @@ impl Settings for ProjectPanelSettings {
             sort_order: project_panel.sort_order.unwrap(),
             diagnostic_badges: project_panel.diagnostic_badges.unwrap(),
             git_status_indicator: project_panel.git_status_indicator.unwrap(),
+            view_selector: project_panel.view_selector.unwrap(),
         }
     }
 }
@@ -193,6 +199,10 @@ impl Settings for ProjectPanelViewsSettings {
                     .unwrap_or_else(|| format!("View {}", index + 1))
                     .into(),
                 provider: view.provider.map(Into::into),
+                group: view
+                    .group
+                    .filter(|group| !group.is_empty())
+                    .map(Into::into),
                 include: view.include.unwrap_or_default(),
                 exclude: view.exclude.unwrap_or_default(),
                 hide_root: view.hide_root,

@@ -726,6 +726,13 @@ pub struct ProjectPanelViewSettingsContent {
     ///
     /// Default: unset (glob-filtered view)
     pub provider: Option<String>,
+    /// Optional group name. Views that share a group name are presented together as one
+    /// selector cluster in the panel header; multiple distinct groups render as separate
+    /// clusters side by side. Views without a group share a single default cluster. Grouping
+    /// only affects presentation — one view is active at a time regardless of grouping.
+    ///
+    /// Default: unset (default cluster)
+    pub group: Option<String>,
     /// Glob patterns of files to show in this view. When empty, all files are shown.
     /// Patterns are matched case-sensitively against worktree-relative paths, with the same
     /// semantics as `file_scan_exclusions`: a bare name like `bin` matches at any depth, so
@@ -859,6 +866,12 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub git_status_indicator: Option<bool>,
+    /// How the project panel view selector presents each group of views: `tabs` shows every view
+    /// as its own tab, `group_tabs` collapses each group into a single tab with a dropdown. This
+    /// is the default layout; it can be changed at runtime from the panel header.
+    ///
+    /// Default: tabs
+    pub view_selector: Option<ProjectPanelViewSelector>,
 }
 
 #[derive(
@@ -959,6 +972,30 @@ impl From<ProjectPanelSortOrder> for util::paths::SortOrder {
             ProjectPanelSortOrder::Unicode => Self::Unicode,
         }
     }
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPanelViewSelector {
+    /// Show every view as its own side-by-side tab.
+    #[default]
+    Tabs,
+    /// Collapse each group of views into a single tab with a dropdown to switch between the
+    /// group's views (Rider-style).
+    GroupTabs,
 }
 
 #[with_fallible_options]

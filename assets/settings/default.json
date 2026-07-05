@@ -876,6 +876,15 @@
     "diagnostic_badges": false,
     // Whether to show the git status indicator next to file names in the project panel.
     "git_status_indicator": false,
+    // How the project panel view selector presents each group of views.
+    // This is the default layout; it can be changed at runtime from the panel header.
+    // This setting can take two values:
+    //
+    // 1. Show every view as its own side-by-side tab:
+    //    "tabs"
+    // 2. Collapse each group of views into a single tab with a dropdown:
+    //    "group_tabs"
+    "view_selector": "tabs",
     // Whether to enable drag-and-drop operations in the project panel.
     "drag_and_drop": true,
     // Whether to hide the root entry when only one folder is open in the window;

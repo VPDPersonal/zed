@@ -48,8 +48,8 @@ use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    DockSide, ProjectPanelEntrySpacing, Settings, SettingsLocation, SettingsStore, ShowDiagnostics,
-    ShowIndentGuides, update_settings_file,
+    DockSide, ProjectPanelEntrySpacing, ProjectPanelViewSelector, Settings, SettingsLocation,
+    SettingsStore, ShowDiagnostics, ShowIndentGuides, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::{
@@ -66,8 +66,9 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -170,6 +171,13 @@ pub struct ProjectPanel {
     selection: Option<SelectedEntry>,
     // Index into `ProjectPanelViewsSettings::views` of the currently active view tab.
     active_view: usize,
+    // Transient override of the `project_panel.view_selector` layout, toggled from the panel
+    // header. `None` uses the settings default; `Some` wins until the panel is recreated.
+    view_selector_override: Option<ProjectPanelViewSelector>,
+    // Per-group memory of the last view selected within each group (keyed by group name; `None`
+    // for the ungrouped cluster). Lets a group's tab keep showing the view the user last picked
+    // there when the active view lives in another group, instead of resetting to the first view.
+    group_last_selected: HashMap<Option<SharedString>, usize>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
     clipboard: Option<ClipboardEntry>,
@@ -1028,6 +1036,8 @@ impl ProjectPanel {
                 marked_entries: Default::default(),
                 selection: None,
                 active_view: 0,
+                view_selector_override: None,
+                group_last_selected: HashMap::default(),
                 context_menu: None,
                 filename_editor,
                 clipboard: None,
@@ -7433,6 +7443,14 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
 
 impl ProjectPanel {
     fn set_active_view(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Remember this view as its group's current selection so switching to another group and
+        // back keeps showing it, rather than resetting to the group's first view.
+        let group = Self::views_settings(&self.project, cx)
+            .views
+            .get(index)
+            .and_then(|view| view.group.clone());
+        self.group_last_selected.insert(group, index);
+
         if self.active_view == index {
             return;
         }
@@ -7531,55 +7549,253 @@ impl ProjectPanel {
             })
     }
 
-    fn render_view_tabs(&self, cx: &Context<Self>) -> Option<Div> {
+    /// The layout the view selector should use right now: the transient header override when set,
+    /// otherwise the `project_panel.view_selector` settings default.
+    fn effective_view_selector(&self, cx: &App) -> ProjectPanelViewSelector {
+        self.view_selector_override
+            .unwrap_or_else(|| ProjectPanelSettings::get_global(cx).view_selector)
+    }
+
+    /// Overrides the view selector layout, remembered until the panel is recreated (it
+    /// deliberately does not write back to settings).
+    fn set_view_selector(&mut self, selector: ProjectPanelViewSelector, cx: &mut Context<Self>) {
+        self.view_selector_override = Some(selector);
+        cx.notify();
+    }
+
+    fn render_view_selector(&self, cx: &Context<Self>) -> Option<Div> {
         if self.project.read(cx).visible_worktrees(cx).count() != 1 {
             return None;
         }
-        let (view_count, names) = {
+        // Partition views into selector clusters by their `group`, preserving the order each
+        // group first appears in; ungrouped views share a single default cluster. One view is
+        // active across all clusters regardless of grouping.
+        let mut groups: Vec<(Option<SharedString>, Vec<(usize, SharedString)>)> = Vec::new();
+        let view_count = {
             let views = &Self::views_settings(&self.project, cx).views;
             if views.len() < 2 {
                 return None;
             }
-            (
-                views.len(),
-                views
-                    .iter()
-                    .map(|view| view.name.clone())
-                    .collect::<Vec<SharedString>>(),
-            )
+            for (index, view) in views.iter().enumerate() {
+                let entry = (index, view.name.clone());
+                match groups.iter_mut().find(|(key, _)| *key == view.group) {
+                    Some((_, cluster)) => cluster.push(entry),
+                    None => groups.push((view.group.clone(), vec![entry])),
+                }
+            }
+            views.len()
         };
         let active_view = self.active_view.min(view_count - 1);
+        let mode = self.effective_view_selector(cx);
 
-        let mut tab_bar = h_flex().w_full().h(ui::Tab::container_height(cx));
-        for (index, name) in names.into_iter().enumerate() {
-            if index > 0 {
-                tab_bar =
-                    tab_bar.child(ui::Divider::vertical().color(ui::DividerColor::BorderFaded));
+        let mut row = h_flex().w_full().h(ui::Tab::container_height(cx));
+        for (cluster_index, (group, cluster)) in groups.iter().enumerate() {
+            if cluster_index > 0 {
+                row = row.child(ui::Divider::vertical().color(ui::DividerColor::BorderFaded));
             }
-            let is_active = index == active_view;
-            tab_bar = tab_bar.child(
-                h_flex()
-                    .id(("project-panel-view-tab", index))
-                    .flex_1()
-                    .h_full()
-                    .py_1()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .border_b_1()
-                    .when(!is_active, |style| {
-                        style
-                            .bg(cx.theme().colors().editor_background.opacity(0.6))
-                            .border_color(cx.theme().colors().border.opacity(0.6))
-                    })
-                    .child(Label::new(name).when(!is_active, |label| label.color(Color::Muted)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_active_view(index, window, cx);
-                    })),
-            );
+            match mode {
+                ProjectPanelViewSelector::Tabs => {
+                    for (index, name) in cluster {
+                        row = row.child(self.render_view_tab(*index, name.clone(), active_view, cx));
+                    }
+                }
+                ProjectPanelViewSelector::GroupTabs => {
+                    row = row.child(self.render_view_group_tab(
+                        cluster_index,
+                        group,
+                        cluster,
+                        active_view,
+                        cx,
+                    ));
+                }
+            }
         }
-        Some(tab_bar)
+
+        // Seat the options button in a trailing cell styled like an inactive tab so the tab bar's
+        // bottom border runs unbroken to the panel's right edge, instead of leaving the button
+        // floating on the bare background.
+        row = row
+            .child(ui::Divider::vertical().color(ui::DividerColor::BorderFaded))
+            .child(
+                h_flex()
+                    .h_full()
+                    .px_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border.opacity(0.6))
+                    .bg(cx.theme().colors().editor_background.opacity(0.6))
+                    .child(self.render_view_selector_menu(cx)),
+            );
+        Some(row)
     }
+
+    fn render_view_tab(
+        &self,
+        index: usize,
+        name: SharedString,
+        active_view: usize,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = index == active_view;
+        view_tab_container(("project-panel-view-tab", index), is_active, cx)
+            .px_2()
+            .cursor_pointer()
+            .child(
+                Label::new(name)
+                    .single_line()
+                    .when(!is_active, |label| label.color(Color::Muted)),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_active_view(index, window, cx);
+            }))
+    }
+
+    /// A grouped tab in `GroupTabs` layout: clicking the label body activates the group's shown
+    /// view, while only the trailing chevron opens the dropdown to switch between the group's views.
+    fn render_view_group_tab(
+        &self,
+        cluster_index: usize,
+        group: &Option<SharedString>,
+        cluster: &[(usize, SharedString)],
+        active_view: usize,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        // The tab shows the active view when it belongs to this group; otherwise the view the user
+        // last picked here (remembered per group), falling back to the group's first view — its
+        // default entry point, and what clicking the label activates.
+        let owns_active = cluster.iter().any(|(index, _)| *index == active_view);
+        let (shown_index, label) = cluster
+            .iter()
+            .find(|(index, _)| *index == active_view)
+            .or_else(|| {
+                self.group_last_selected
+                    .get(group)
+                    .and_then(|remembered| cluster.iter().find(|(index, _)| index == remembered))
+            })
+            .or_else(|| cluster.first())
+            .map(|(index, name)| (*index, name.clone()))
+            .unwrap_or((active_view, SharedString::default()));
+        let entries = cluster.to_vec();
+        let this = cx.weak_entity();
+
+        view_tab_container(("project-panel-view-group", cluster_index), owns_active, cx).child(
+            h_flex()
+                .size_full()
+                .child(
+                    h_flex()
+                        .id(("project-panel-view-group-label", cluster_index))
+                        .flex_1()
+                        .h_full()
+                        .pl_2()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(
+                            Label::new(label)
+                                .single_line()
+                                .when(!owns_active, |label| label.color(Color::Muted)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_active_view(shown_index, window, cx);
+                        })),
+                )
+                .child(
+                    PopoverMenu::new(("project-panel-view-group-menu", cluster_index))
+                        .trigger(
+                            IconButton::new(
+                                ("project-panel-view-group-chevron", cluster_index),
+                                IconName::ChevronDown,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Switch View")),
+                        )
+                        // Drop the list below the chevron, right-aligned so it stays on-screen.
+                        .anchor(gpui::Anchor::TopRight)
+                        .offset(gpui::point(px(0.), px(2.)))
+                        .menu(move |window, cx| {
+                            let this = this.clone();
+                            let entries = entries.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                                for (index, name) in entries.iter() {
+                                    let index = *index;
+                                    let this = this.clone();
+                                    menu = menu.toggleable_entry(
+                                        name.clone(),
+                                        index == active_view,
+                                        IconPosition::End,
+                                        None,
+                                        move |window, cx| {
+                                            this.update(cx, |this, cx| {
+                                                this.set_active_view(index, window, cx);
+                                            })
+                                            .ok();
+                                        },
+                                    );
+                                }
+                                menu
+                            }))
+                        }),
+                ),
+        )
+    }
+
+    /// The trailing options button: a sliders icon that opens a menu instead of toggling directly,
+    /// leaving room for more panel-view options to be added as future sections.
+    fn render_view_selector_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let current = self.effective_view_selector(cx);
+        let this = cx.weak_entity();
+        PopoverMenu::new("project-panel-view-selector-menu")
+            .trigger(
+                IconButton::new("project-panel-view-selector-options", IconName::Sliders)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("View Options")),
+            )
+            // Drop the menu below the button, aligned to its right edge.
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::point(px(0.), px(2.)))
+            .menu(move |window, cx| {
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    let entry = |menu: ContextMenu, label: &'static str, selector| {
+                        let this = this.clone();
+                        menu.toggleable_entry(
+                            label,
+                            current == selector,
+                            IconPosition::End,
+                            None,
+                            move |_window, cx| {
+                                this.update(cx, |this, cx| this.set_view_selector(selector, cx))
+                                    .ok();
+                            },
+                        )
+                    };
+                    let menu = menu.header("Layout");
+                    let menu = entry(menu, "Tabs", ProjectPanelViewSelector::Tabs);
+                    entry(menu, "Group Tabs", ProjectPanelViewSelector::GroupTabs)
+                }))
+            })
+    }
+}
+
+/// Styles a project-panel view-selector tab shell — background, hover, and the bottom border that
+/// forms the tab bar's baseline — shared by the plain tabs and the grouped tabs so they match.
+/// The active tab keeps the panel background and a transparent baseline; inactive tabs get a dim
+/// tray fill and a faded border. Hand-rolled rather than reusing [`ui::Tab`], whose pane-tab
+/// borders differ. The caller fills in the content (label, chevron) and click handling.
+fn view_tab_container(id: impl Into<ElementId>, active: bool, cx: &App) -> gpui::Stateful<Div> {
+    h_flex()
+        .id(id)
+        .flex_1()
+        .h(ui::Tab::container_height(cx))
+        .relative()
+        .justify_center()
+        .border_b_1()
+        .hover(|style| style.bg(cx.theme().colors().element_hover))
+        .when(!active, |style| {
+            style
+                .bg(cx.theme().colors().editor_background.opacity(0.6))
+                .border_color(cx.theme().colors().border.opacity(0.6))
+        })
 }
 
 impl Render for ProjectPanel {
@@ -7767,7 +7983,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
-                        .children(self.render_view_tabs(cx))
+                        .children(self.render_view_selector(cx))
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
