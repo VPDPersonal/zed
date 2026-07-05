@@ -220,13 +220,26 @@ fn join_rel(dir: &str, child: &str) -> String {
     }
 }
 
-fn container(id: SharedString, title: impl Into<SharedString>) -> ProjectPanelViewNode {
+/// Embedded SVG icon paths for the *virtual* nodes that have no backing file and thus no
+/// icon-theme association (rooted at `assets/icons/…`, so `Icon::from_path` resolves them without
+/// an icon theme). File-backed nodes (`.sln`, `.csproj`, project references, source files) instead
+/// carry a `project_path` and leave `icon` unset, so the host resolves their glyph from the user's
+/// active icon theme by file type — matching whatever the file tree shows for the same file.
+const DEPENDENCIES_ICON: &str = "icons/blocks.svg";
+const PACKAGE_ICON: &str = "icons/file_icons/package.svg";
+
+fn container(
+    id: SharedString,
+    title: impl Into<SharedString>,
+    icon: Option<SharedString>,
+    project_path: Option<ProjectPath>,
+) -> ProjectPanelViewNode {
     ProjectPanelViewNode {
         id,
         title: title.into(),
-        icon: None,
+        icon,
         is_container: true,
-        project_path: None,
+        project_path,
     }
 }
 
@@ -234,11 +247,12 @@ fn leaf(
     id: SharedString,
     title: impl Into<SharedString>,
     project_path: Option<ProjectPath>,
+    icon: Option<SharedString>,
 ) -> ProjectPanelViewNode {
     ProjectPanelViewNode {
         id,
         title: title.into(),
-        icon: None,
+        icon,
         is_container: false,
         project_path,
     }
@@ -257,7 +271,12 @@ impl SolutionProvider {
             return solutions
                 .into_iter()
                 .map(|(name, rel)| {
-                    container(encode_id(NodeKind::Solution, worktree_id, &rel), name)
+                    container(
+                        encode_id(NodeKind::Solution, worktree_id, &rel),
+                        name,
+                        None,
+                        project_path(worktree_id, &rel),
+                    )
                 })
                 .collect();
         }
@@ -295,6 +314,8 @@ impl SolutionProvider {
                 let mut nodes = vec![container(
                     encode_id(NodeKind::Dependencies, worktree_id, rel),
                     "Dependencies",
+                    Some(DEPENDENCIES_ICON.into()),
+                    None,
                 )];
                 let text = access.load(rel).await?;
                 let info = parse_csproj(&text);
@@ -320,7 +341,12 @@ impl SolutionProvider {
                     };
                     // Qualify leaf ids with the owning `.csproj` so the same package referenced by
                     // two projects yields distinct element ids in the rendered list.
-                    nodes.push(leaf(format!("pkg|{rel}|{name}").into(), title, None));
+                    nodes.push(leaf(
+                        format!("pkg|{rel}|{name}").into(),
+                        title,
+                        None,
+                        Some(PACKAGE_ICON.into()),
+                    ));
                 }
                 for reference in info.project_references {
                     let title = reference
@@ -334,6 +360,7 @@ impl SolutionProvider {
                         format!("projref|{rel}|{target}").into(),
                         title,
                         project_path(worktree_id, &target),
+                        None,
                     ));
                 }
                 Ok(nodes)
@@ -361,6 +388,8 @@ fn project_node(worktree_id: WorktreeId, name: &str, csproj_rel: &str) -> Projec
     container(
         encode_id(NodeKind::Project, worktree_id, csproj_rel),
         name.to_string(),
+        None,
+        project_path(worktree_id, csproj_rel),
     )
 }
 
@@ -381,12 +410,18 @@ fn dir_nodes(
         })
         .map(|(name, is_dir, rel)| {
             if is_dir {
-                container(encode_id(NodeKind::Directory, worktree_id, &rel), name)
+                container(
+                    encode_id(NodeKind::Directory, worktree_id, &rel),
+                    name,
+                    None,
+                    None,
+                )
             } else {
                 leaf(
                     format!("file|{rel}").into(),
                     name,
                     project_path(worktree_id, &rel),
+                    None,
                 )
             }
         })
@@ -440,6 +475,8 @@ fn item_nodes(
                 &format!("{csproj_rel}|{subdir}"),
             ),
             name,
+            None,
+            None,
         ));
     }
     for (name, item) in files {
@@ -448,6 +485,7 @@ fn item_nodes(
             format!("item|{csproj_rel}|{item}").into(),
             name,
             project_path(worktree_id, &target),
+            None,
         ));
     }
     nodes

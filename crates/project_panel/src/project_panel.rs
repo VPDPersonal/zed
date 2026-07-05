@@ -6891,14 +6891,36 @@ impl ProjectPanel {
         let is_expanded = details.is_expanded;
         let item_colors = get_item_color(false, cx);
 
-        let icon = if is_container {
+        // A provider row shows up to two glyphs, Solution-Explorer style: a disclosure chevron
+        // for containers, followed by a type icon. Icon precedence: an explicit `node.icon`
+        // (a virtual glyph like a "Dependencies" node) wins; otherwise a node backed by a real
+        // file resolves its icon from the active icon theme by path (so a `.sln`/`.csproj`/source
+        // file matches whatever icon theme the user has installed, even for expandable containers);
+        // remaining containers fall back to a folder icon.
+        let chevron = if is_container {
             FileIcons::get_chevron_icon(is_expanded, cx)
-        } else if let Some(icon) = node.icon.clone() {
+        } else {
+            None
+        };
+        let type_icon = if let Some(icon) = node.icon.clone() {
             Some(icon)
         } else if let Some(project_path) = &node.project_path {
             FileIcons::get_icon(project_path.path.as_std_path(), cx)
+        } else if is_container {
+            FileIcons::get_folder_icon(is_expanded, Path::new(node.title.as_ref()), cx)
         } else {
             None
+        };
+
+        let icon_slot = |icon: Option<SharedString>| {
+            if let Some(icon) = icon {
+                h_flex().child(Icon::from_path(icon).color(Color::Muted))
+            } else {
+                h_flex()
+                    .size(IconSize::default().rems())
+                    .invisible()
+                    .flex_none()
+            }
         };
 
         let views_settings = Self::views_settings(&self.project, cx);
@@ -6917,14 +6939,8 @@ impl ProjectPanel {
             .gap_1()
             .bg(item_colors.default)
             .hover(|style| style.bg(item_colors.hover))
-            .child(if let Some(icon) = icon {
-                h_flex().child(Icon::from_path(icon).color(Color::Muted))
-            } else {
-                h_flex()
-                    .size(IconSize::default().rems())
-                    .invisible()
-                    .flex_none()
-            })
+            .child(icon_slot(chevron))
+            .child(icon_slot(type_icon))
             .child(Label::new(node.title).single_line())
             .when_some(
                 provider_id.filter(|_| is_container),
