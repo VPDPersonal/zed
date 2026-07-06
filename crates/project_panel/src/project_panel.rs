@@ -4407,6 +4407,7 @@ impl ProjectPanel {
         let now = Instant::now();
         let settings = ProjectPanelSettings::get_global(cx);
         let auto_collapse_dirs = settings.auto_fold_dirs;
+        let fold_single_file_dirs = self.effective_fold_single_file_dirs(cx);
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
         let sort_order = settings.sort_order;
@@ -4570,6 +4571,27 @@ impl ProjectPanel {
                                 }
                                 entry_iter.advance();
                                 continue;
+                            }
+                            // Fold a directory whose only child is a single file into one
+                            // `dir/file` row: skip the directory so the lone file becomes the
+                            // visible leaf and renders the compact path from its depth difference,
+                            // opening on click. Independent of `auto_fold_dirs` (combines with it
+                            // for a chain like `a/b/file`); the worktree root is never folded away.
+                            if fold_single_file_dirs
+                                && entry.kind.is_dir()
+                                && !new_state.is_unfolded(&entry.id)
+                                && let Some(root_path) = worktree_snapshot.root_entry()
+                                && entry.path != root_path.path
+                            {
+                                let mut child_entries =
+                                    worktree_snapshot.child_entries(&entry.path);
+                                if let Some(child) = child_entries.next()
+                                    && child_entries.next().is_none()
+                                    && child.kind.is_file()
+                                {
+                                    entry_iter.advance();
+                                    continue;
+                                }
                             }
                             if auto_collapse_dirs && entry.kind.is_dir() {
                                 auto_folded_ancestors.push(entry.id);
@@ -7508,6 +7530,26 @@ impl ProjectPanel {
         self.resolved_view(views, cx)
             .and_then(|view| view.hide_root)
             .unwrap_or(global)
+    }
+
+    /// Whether single-file directories should be folded into one `dir/file` row right now: the
+    /// panel's `fold_single_file_dirs` (read with project-local `.zed/settings.json` taken into
+    /// account), overridden by the active view's own `fold_single_file_dirs` when it sets one.
+    fn effective_fold_single_file_dirs(&self, cx: &App) -> bool {
+        let location = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| SettingsLocation {
+                worktree_id: worktree.read(cx).id(),
+                path: RelPath::empty(),
+            });
+        let panel = ProjectPanelSettings::get(location, cx).fold_single_file_dirs;
+        let views = Self::views_settings(&self.project, cx);
+        self.resolved_view(views, cx)
+            .and_then(|view| view.fold_single_file_dirs)
+            .unwrap_or(panel)
     }
 
     /// Whether the active view's include/exclude filter currently hides this entry. Used to

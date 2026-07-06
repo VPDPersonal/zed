@@ -760,6 +760,12 @@ pub struct ProjectPanelViewSettingsContent {
     ///
     /// Default: []
     pub hide_dirs: Option<Vec<String>>,
+    /// Whether this view folds a directory holding a single file into one `dir/file` row.
+    /// When unset, inherits the panel's `project_panel.fold_single_file_dirs` (which itself may
+    /// be overridden per project via `.zed/settings.json`).
+    ///
+    /// Default: inherit `project_panel.fold_single_file_dirs`
+    pub fold_single_file_dirs: Option<bool>,
 }
 
 #[with_fallible_options]
@@ -814,6 +820,12 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub auto_fold_dirs: Option<bool>,
+    /// Whether to fold a directory that contains a single file into one `dir/file` row that
+    /// opens the file on click. Independent of `auto_fold_dirs`; combines with it so a chain of
+    /// single-child directories ending in a lone file collapses into a single compact row.
+    ///
+    /// Default: false
+    pub fold_single_file_dirs: Option<bool>,
     /// Whether to show folder names with bold text in the project panel.
     ///
     /// Default: false
