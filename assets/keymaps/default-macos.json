@@ -1056,6 +1056,18 @@
     },
   },
   {
+    "context": "ProjectPanel && not_editing && view_selector",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-1": ["project_panel::ActivateView", 0],
+      "cmd-2": ["project_panel::ActivateView", 1],
+      "cmd-3": ["project_panel::ActivateView", 2],
+      "cmd-4": ["project_panel::ActivateView", 3],
+      "ctrl-tab": "project_panel::ActivateNextView",
+      "ctrl-shift-tab": "project_panel::ActivatePreviousView",
+    },
+  },
+  {
     "context": "VariableList",
     "use_key_equivalents": true,
     "bindings": {

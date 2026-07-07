@@ -1008,6 +1008,17 @@
     },
   },
   {
+    "context": "ProjectPanel && not_editing && view_selector",
+    "bindings": {
+      "ctrl-1": ["project_panel::ActivateView", 0],
+      "ctrl-2": ["project_panel::ActivateView", 1],
+      "ctrl-3": ["project_panel::ActivateView", 2],
+      "ctrl-4": ["project_panel::ActivateView", 3],
+      "ctrl-tab": "project_panel::ActivateNextView",
+      "ctrl-shift-tab": "project_panel::ActivatePreviousView",
+    },
+  },
+  {
     "context": "GitPanel",
     "bindings": {
       "ctrl-1": "git_panel::ActivateChangesTab",

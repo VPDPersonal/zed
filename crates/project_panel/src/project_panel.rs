@@ -67,8 +67,8 @@ use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
     IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
-    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
-    WithScrollbar, prelude::*,
+    PopoverMenuHandle, ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars,
+    StickyCandidate, Tooltip, WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -178,6 +178,10 @@ pub struct ProjectPanel {
     // for the ungrouped cluster). Lets a group's tab keep showing the view the user last picked
     // there when the active view lives in another group, instead of resetting to the first view.
     group_last_selected: HashMap<Option<SharedString>, usize>,
+    // Handle used to open the active group's view dropdown from the keyboard (the
+    // `project_panel::ActivateView` shortcut pressed while already on that group's tab). It is
+    // wired to whichever `GroupTabs` cluster currently owns the active view.
+    view_group_menu_handle: PopoverMenuHandle<ContextMenu>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
     clipboard: Option<ClipboardEntry>,
@@ -361,6 +365,13 @@ struct SelectPrevDiagnostic {
     pub severity: GoToDiagnosticSeverityFilter,
 }
 
+/// Activates the view-selector tab at the given index. When that tab is already active and it is a
+/// group holding multiple views, opens its dropdown instead so the group's views can be switched
+/// with the arrow keys.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = project_panel)]
+struct ActivateView(pub usize);
+
 actions!(
     project_panel,
     [
@@ -434,6 +445,10 @@ actions!(
         SelectNextDirectory,
         /// Selects the previous directory.
         SelectPrevDirectory,
+        /// Activates the next view-selector tab, wrapping around at the end.
+        ActivateNextView,
+        /// Activates the previous view-selector tab, wrapping around at the start.
+        ActivatePreviousView,
         /// Opens a diff view to compare two marked files.
         CompareMarkedFiles,
         /// Undoes the last file operation.
@@ -444,6 +459,14 @@ actions!(
         OpenMarkdownPreview,
     ]
 );
+
+/// A tab as laid out in the view selector header: the view it activates and the views it stands
+/// for (one view in `Tabs` layout, a whole group cluster in `GroupTabs`). Backs the keyboard
+/// shortcuts that map tab positions to views.
+struct ViewTab {
+    target: usize,
+    members: Vec<usize>,
+}
 
 #[derive(Clone, Debug, Default)]
 struct FoldedAncestors {
@@ -1038,6 +1061,7 @@ impl ProjectPanel {
                 active_view: 0,
                 view_selector_override: None,
                 group_last_selected: HashMap::default(),
+                view_group_menu_handle: PopoverMenuHandle::default(),
                 context_menu: None,
                 filename_editor,
                 clipboard: None,
@@ -7186,6 +7210,15 @@ impl ProjectPanel {
         };
 
         dispatch_context.add(identifier);
+
+        // Gate the view-tab shortcuts (`cmd/ctrl-1..4`, `ctrl-tab`) on tabs actually being shown,
+        // so that with the (opt-in) views feature unconfigured those chords keep falling through to
+        // their global bindings (e.g. `workspace::ActivatePane`) instead of becoming dead keys
+        // while the panel is focused.
+        if self.view_clusters(cx).is_some() {
+            dispatch_context.add("view_selector");
+        }
+
         dispatch_context
     }
 
@@ -7464,6 +7497,115 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
 }
 
 impl ProjectPanel {
+    /// The view a group's tab currently points at: the active view when it belongs to the group,
+    /// otherwise the view last selected there (remembered per group), falling back to the group's
+    /// first view. Shared by the grouped tab rendering and the keyboard shortcuts so both agree on
+    /// which view a group activates.
+    fn group_shown_view(
+        &self,
+        active_view: usize,
+        group: &Option<SharedString>,
+        cluster: &[(usize, SharedString)],
+    ) -> usize {
+        cluster
+            .iter()
+            .find(|(index, _)| *index == active_view)
+            .or_else(|| {
+                self.group_last_selected
+                    .get(group)
+                    .and_then(|remembered| cluster.iter().find(|(index, _)| index == remembered))
+            })
+            .or_else(|| cluster.first())
+            .map(|(index, _)| *index)
+            .unwrap_or(active_view)
+    }
+
+    /// The tabs the view selector lays out right now, in visual order: every view is its own tab in
+    /// `Tabs` layout, while each group cluster collapses to a single tab in `GroupTabs`. `None` when
+    /// the selector isn't shown. Drives the `ActivateView`/`ActivateNextView`/`ActivatePreviousView`
+    /// shortcuts.
+    fn view_tabs(&self, cx: &App) -> Option<Vec<ViewTab>> {
+        let clusters = self.view_clusters(cx)?;
+        let view_count: usize = clusters.iter().map(|(_, cluster)| cluster.len()).sum();
+        let active_view = self.active_view.min(view_count - 1);
+        let tabs = match self.effective_view_selector(cx) {
+            ProjectPanelViewSelector::Tabs => clusters
+                .iter()
+                .flat_map(|(_, cluster)| cluster.iter())
+                .map(|(index, _)| ViewTab {
+                    target: *index,
+                    members: vec![*index],
+                })
+                .collect(),
+            ProjectPanelViewSelector::GroupTabs => clusters
+                .iter()
+                .map(|(group, cluster)| ViewTab {
+                    target: self.group_shown_view(active_view, group, cluster),
+                    members: cluster.iter().map(|(index, _)| *index).collect(),
+                })
+                .collect(),
+        };
+        Some(tabs)
+    }
+
+    /// Activates the view tab at `action.0`. If that tab is already active and stands for a group
+    /// of several views, opens the group's dropdown instead so its views can be picked with the
+    /// arrow keys; a plain single-view tab has nothing further to open.
+    fn activate_view(&mut self, action: &ActivateView, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tabs) = self.view_tabs(cx) else {
+            return;
+        };
+        let Some(tab) = tabs.get(action.0) else {
+            return;
+        };
+        if tab.members.contains(&self.active_view) {
+            if tab.members.len() > 1 {
+                window.focus(&self.focus_handle, cx);
+                self.view_group_menu_handle.toggle(window, cx);
+            }
+        } else {
+            self.set_active_view(tab.target, window, cx);
+        }
+    }
+
+    fn activate_next_view(
+        &mut self,
+        _: &ActivateNextView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_view(1, window, cx);
+    }
+
+    fn activate_previous_view(
+        &mut self,
+        _: &ActivatePreviousView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_view(-1, window, cx);
+    }
+
+    /// Moves the active view to the next (`delta == 1`) or previous (`delta == -1`) visual tab,
+    /// wrapping around at the ends.
+    fn cycle_view(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tabs) = self.view_tabs(cx) else {
+            return;
+        };
+        let len = tabs.len() as isize;
+        if len == 0 {
+            return;
+        }
+        let current = tabs
+            .iter()
+            .position(|tab| tab.members.contains(&self.active_view))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len) as usize;
+        if let Some(tab) = tabs.get(next) {
+            self.set_active_view(tab.target, window, cx);
+        }
+    }
+
     fn set_active_view(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         // Remember this view as its group's current selection so switching to another group and
         // back keeps showing it, rather than resetting to the group's first view.
@@ -7605,28 +7747,36 @@ impl ProjectPanel {
         cx.notify();
     }
 
-    fn render_view_selector(&self, cx: &Context<Self>) -> Option<Div> {
+    /// Partitions the configured views into selector clusters by their `group`, preserving the
+    /// order each group first appears in; ungrouped views share a single default cluster. One view
+    /// is active across all clusters regardless of grouping. Returns `None` when the selector isn't
+    /// shown (fewer than two views, or not exactly one visible worktree) — the same gate as
+    /// [`Self::render_view_selector`].
+    fn view_clusters(
+        &self,
+        cx: &App,
+    ) -> Option<Vec<(Option<SharedString>, Vec<(usize, SharedString)>)>> {
         if self.project.read(cx).visible_worktrees(cx).count() != 1 {
             return None;
         }
-        // Partition views into selector clusters by their `group`, preserving the order each
-        // group first appears in; ungrouped views share a single default cluster. One view is
-        // active across all clusters regardless of grouping.
+        let views = &Self::views_settings(&self.project, cx).views;
+        if views.len() < 2 {
+            return None;
+        }
         let mut groups: Vec<(Option<SharedString>, Vec<(usize, SharedString)>)> = Vec::new();
-        let view_count = {
-            let views = &Self::views_settings(&self.project, cx).views;
-            if views.len() < 2 {
-                return None;
+        for (index, view) in views.iter().enumerate() {
+            let entry = (index, view.name.clone());
+            match groups.iter_mut().find(|(key, _)| *key == view.group) {
+                Some((_, cluster)) => cluster.push(entry),
+                None => groups.push((view.group.clone(), vec![entry])),
             }
-            for (index, view) in views.iter().enumerate() {
-                let entry = (index, view.name.clone());
-                match groups.iter_mut().find(|(key, _)| *key == view.group) {
-                    Some((_, cluster)) => cluster.push(entry),
-                    None => groups.push((view.group.clone(), vec![entry])),
-                }
-            }
-            views.len()
-        };
+        }
+        Some(groups)
+    }
+
+    fn render_view_selector(&self, cx: &Context<Self>) -> Option<Div> {
+        let groups = self.view_clusters(cx)?;
+        let view_count: usize = groups.iter().map(|(_, cluster)| cluster.len()).sum();
         let active_view = self.active_view.min(view_count - 1);
         let mode = self.effective_view_selector(cx);
 
@@ -7706,19 +7856,57 @@ impl ProjectPanel {
         // last picked here (remembered per group), falling back to the group's first view — its
         // default entry point, and what clicking the label activates.
         let owns_active = cluster.iter().any(|(index, _)| *index == active_view);
-        let (shown_index, label) = cluster
+        let shown_index = self.group_shown_view(active_view, group, cluster);
+        let label = cluster
             .iter()
-            .find(|(index, _)| *index == active_view)
-            .or_else(|| {
-                self.group_last_selected
-                    .get(group)
-                    .and_then(|remembered| cluster.iter().find(|(index, _)| index == remembered))
-            })
-            .or_else(|| cluster.first())
-            .map(|(index, name)| (*index, name.clone()))
-            .unwrap_or((active_view, SharedString::default()));
+            .find(|(index, _)| *index == shown_index)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_default();
         let entries = cluster.to_vec();
         let this = cx.weak_entity();
+
+        let mut group_menu = PopoverMenu::new(("project-panel-view-group-menu", cluster_index))
+            .trigger(
+                IconButton::new(
+                    ("project-panel-view-group-chevron", cluster_index),
+                    IconName::ChevronDown,
+                )
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Switch View")),
+            )
+            // Drop the list below the chevron, right-aligned so it stays on-screen.
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::point(px(0.), px(2.)))
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let entries = entries.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    for (index, name) in entries.iter() {
+                        let index = *index;
+                        let this = this.clone();
+                        menu = menu.toggleable_entry(
+                            name.clone(),
+                            index == active_view,
+                            IconPosition::End,
+                            None,
+                            move |window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.set_active_view(index, window, cx);
+                                })
+                                .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            });
+        // Only the tab that owns the active view carries the shared dropdown handle, so the
+        // `project_panel::ActivateView` shortcut (pressed again while already on this tab) opens
+        // this group's list rather than some other group's.
+        if owns_active {
+            group_menu = group_menu.with_handle(self.view_group_menu_handle.clone());
+        }
 
         view_tab_container(("project-panel-view-group", cluster_index), owns_active, cx).child(
             h_flex()
@@ -7740,44 +7928,7 @@ impl ProjectPanel {
                             this.set_active_view(shown_index, window, cx);
                         })),
                 )
-                .child(
-                    PopoverMenu::new(("project-panel-view-group-menu", cluster_index))
-                        .trigger(
-                            IconButton::new(
-                                ("project-panel-view-group-chevron", cluster_index),
-                                IconName::ChevronDown,
-                            )
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Switch View")),
-                        )
-                        // Drop the list below the chevron, right-aligned so it stays on-screen.
-                        .anchor(gpui::Anchor::TopRight)
-                        .offset(gpui::point(px(0.), px(2.)))
-                        .menu(move |window, cx| {
-                            let this = this.clone();
-                            let entries = entries.clone();
-                            Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                                for (index, name) in entries.iter() {
-                                    let index = *index;
-                                    let this = this.clone();
-                                    menu = menu.toggleable_entry(
-                                        name.clone(),
-                                        index == active_view,
-                                        IconPosition::End,
-                                        None,
-                                        move |window, cx| {
-                                            this.update(cx, |this, cx| {
-                                                this.set_active_view(index, window, cx);
-                                            })
-                                            .ok();
-                                        },
-                                    );
-                                }
-                                menu
-                            }))
-                        }),
-                ),
+                .child(group_menu),
         )
     }
 
@@ -7970,6 +8121,9 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::select_prev_diagnostic))
                 .on_action(cx.listener(Self::select_next_directory))
                 .on_action(cx.listener(Self::select_prev_directory))
+                .on_action(cx.listener(Self::activate_view))
+                .on_action(cx.listener(Self::activate_next_view))
+                .on_action(cx.listener(Self::activate_previous_view))
                 .on_action(cx.listener(Self::expand_selected_entry))
                 .on_action(cx.listener(Self::collapse_selected_entry))
                 .on_action(cx.listener(Self::collapse_all_entries))
